@@ -17,7 +17,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("LLM_MOCK", "")
 
 	c := Load()
-	if c.Addr != ":8080" {
+	if c.Addr != "127.0.0.1:8080" {
 		t.Errorf("addr = %q", c.Addr)
 	}
 	if c.BaseURL != "http://127.0.0.1:3000/v1" {

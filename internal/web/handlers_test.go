@@ -148,6 +148,78 @@ func TestAckFlow(t *testing.T) {
 	}
 }
 
+func TestCloseFlow(t *testing.T) {
+	r, st := newTestRouter(t)
+
+	// The close endpoint only accepts acknowledged alerts.
+	w := perform(r, http.MethodPost, "/alerts/ALT-0001/close", "")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("close open alert status = %d, want 409", w.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/alerts/ALT-0001/ack", strings.NewReader("operator=ops-user"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("ack status = %d", w.Code)
+	}
+
+	// Detail page must now offer the close button.
+	if w := perform(r, http.MethodGet, "/alerts/ALT-0001", ""); !strings.Contains(w.Body.String(), "关闭告警") {
+		t.Error("acked detail page has no close action")
+	}
+
+	w = perform(r, http.MethodPost, "/alerts/ALT-0001/close", "")
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("close status = %d", w.Code)
+	}
+	if loc := w.Header().Get("Location"); !strings.Contains(loc, "ok=closed") {
+		t.Errorf("redirect = %q", loc)
+	}
+	a, err := st.GetAlert("ALT-0001")
+	if err != nil {
+		t.Fatalf("get alert: %v", err)
+	}
+	if a.Status != domain.StatusClosed || a.ClosedAt == nil {
+		t.Fatalf("close not persisted: %+v", a)
+	}
+
+	w = perform(r, http.MethodGet, "/alerts/ALT-0001", "")
+	body := w.Body.String()
+	for _, want := range []string{"已关闭", "告警关闭"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("closed detail missing %q", want)
+		}
+	}
+}
+
+func TestAPIClose(t *testing.T) {
+	r, _ := newTestRouter(t)
+
+	if w := perform(r, http.MethodPost, "/api/alerts/ALT-0003/close", "{}"); w.Code != http.StatusConflict {
+		t.Errorf("API close open alert status = %d, want 409", w.Code)
+	}
+
+	if w := perform(r, http.MethodPost, "/api/alerts/ALT-0003/ack", `{"operator":"api-ops"}`); w.Code != http.StatusOK {
+		t.Fatalf("ack status = %d: %s", w.Code, w.Body.String())
+	}
+	w := perform(r, http.MethodPost, "/api/alerts/ALT-0003/close", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("close status = %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Alert   domain.Alert `json:"alert"`
+		Changed bool         `json:"changed"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if !resp.Changed || resp.Alert.Status != domain.StatusClosed || resp.Alert.ClosedAt == nil {
+		t.Fatalf("unexpected close response: %+v", resp)
+	}
+}
+
 func TestNotFound(t *testing.T) {
 	r, _ := newTestRouter(t)
 	if w := perform(r, http.MethodGet, "/alerts/ALT-9999", ""); w.Code != http.StatusNotFound {

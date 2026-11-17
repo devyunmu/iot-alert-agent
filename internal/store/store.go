@@ -20,6 +20,8 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrClosed is returned when an alert is already closed and cannot be acked.
 	ErrClosed = errors.New("alert is closed")
+	// ErrNotAcked is returned when closing an alert that nobody acknowledged.
+	ErrNotAcked = errors.New("alert must be acknowledged before it can be closed")
 )
 
 // Filter narrows an alert listing. Zero values mean "no constraint".
@@ -193,6 +195,31 @@ func (s *Store) AckAlert(id, operator string) (domain.Alert, bool, error) {
 	a.Status = domain.StatusAcked
 	a.AckedBy = operator
 	a.AckedAt = &now
+	s.alerts[id] = a
+	return a, true, nil
+}
+
+// CloseAlert closes an acknowledged alert and stamps ClosedAt, completing the
+// open → acked → closed lifecycle. Closing an already closed alert is a no-op,
+// so retries stay idempotent; closing an open alert is rejected because it would
+// skip the human acknowledgement that carries the audit trail.
+func (s *Store) CloseAlert(id string) (domain.Alert, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a, ok := s.alerts[id]
+	if !ok {
+		return domain.Alert{}, false, fmt.Errorf("alert %q: %w", id, ErrNotFound)
+	}
+	switch a.Status {
+	case domain.StatusClosed:
+		return a, false, nil
+	case domain.StatusOpen:
+		return domain.Alert{}, false, fmt.Errorf("alert %q: %w", id, ErrNotAcked)
+	}
+	now := time.Now().UTC()
+	a.Status = domain.StatusClosed
+	a.ClosedAt = &now
 	s.alerts[id] = a
 	return a, true, nil
 }

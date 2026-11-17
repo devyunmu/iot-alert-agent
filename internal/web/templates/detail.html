@@ -31,6 +31,10 @@
         <input class="operator" type="text" name="operator" value="web-console" maxlength="40" aria-label="操作人">
         <button class="btn" type="submit">确认告警</button>
       </form>
+      {{else if eq (printf "%s" .Alert.Status) "acked"}}
+      <form method="post" action="/alerts/{{.Alert.ID}}/close" class="inline-form">
+        <button class="btn" type="submit">关闭告警</button>
+      </form>
       {{end}}
       <form method="post" action="/alerts/{{.Alert.ID}}/analyze{{if .Alert.Analysis}}?force=1{{end}}" class="inline-form">
         <button class="btn accent" type="submit">{{if .Alert.Analysis}}重新生成建议{{else}}生成 AI 处置建议{{end}}</button>
@@ -151,6 +155,10 @@
         {{else if eq (printf "%s" .Alert.Status) "acked"}}
         <p>已由 <strong>{{.Alert.AckedBy}}</strong> 确认</p>
         <p class="muted mono">{{if .Alert.AckedAt}}{{ts .Alert.AckedAt}}{{end}}</p>
+        <p class="muted">现场处置完成后关闭告警，记录关闭时间。</p>
+        <form method="post" action="/alerts/{{.Alert.ID}}/close">
+          <button class="btn" type="submit">关闭告警</button>
+        </form>
         {{else}}
         <p>告警已关闭</p>
         <p class="muted">确认人 {{.Alert.AckedBy}}{{if .Alert.ClosedAt}} · {{ts .Alert.ClosedAt}}{{end}}</p>

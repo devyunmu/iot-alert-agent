@@ -10,20 +10,35 @@ import (
 )
 
 func TestScore(t *testing.T) {
+	sc := Scoring{KeypointWeight: 0.8, SeverityWeight: 0.2, PassThreshold: 0.75}
 	hits := []Hit{{Hit: true}, {Hit: true}, {Hit: true}, {Hit: false}}
-	rate, sev, score := Score(hits, domain.SeverityCritical, domain.SeverityCritical)
+	rate, sev, score := Score(hits, domain.SeverityCritical, domain.SeverityCritical, sc)
 	if rate != 0.75 || !sev || score != 0.8 {
 		t.Fatalf("rate=%v sev=%v score=%v, want 0.75/true/0.8", rate, sev, score)
 	}
 
-	_, sev, score = Score(hits, domain.SeverityWarning, domain.SeverityCritical)
+	_, sev, score = Score(hits, domain.SeverityWarning, domain.SeverityCritical, sc)
 	if sev || math.Abs(score-0.6) > 1e-9 {
 		t.Fatalf("severity mismatch: sev=%v score=%v, want false/0.6", sev, score)
 	}
 
-	rate, _, score = Score(nil, domain.SeverityInfo, domain.SeverityInfo)
+	rate, _, score = Score(nil, domain.SeverityInfo, domain.SeverityInfo, sc)
 	if rate != 1 || score != 1 {
 		t.Fatalf("empty keypoints: rate=%v score=%v", rate, score)
+	}
+}
+
+// TestScoreUsesConfiguredWeights is the regression for a hard-coded 0.8/0.2:
+// the same hits must produce a different score when the evalset says so.
+func TestScoreUsesConfiguredWeights(t *testing.T) {
+	hits := []Hit{{Hit: true}, {Hit: false}} // 50% keypoints, severity wrong
+	custom := Scoring{KeypointWeight: 0.6, SeverityWeight: 0.4, PassThreshold: 0.5}
+	rate, sev, score := Score(hits, domain.SeverityWarning, domain.SeverityCritical, custom)
+	if rate != 0.5 || sev {
+		t.Fatalf("rate=%v sev=%v", rate, sev)
+	}
+	if math.Abs(score-0.3) > 1e-9 {
+		t.Fatalf("score = %v, want 0.6*0.5 = 0.3", score)
 	}
 }
 
@@ -51,12 +66,26 @@ func TestLoadSetValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSet: %v", err)
 	}
-	if set.Scoring.PassThreshold != 0.75 || len(set.Cases) != 1 {
+	if set.Scoring.PassThreshold != 0.75 || set.Scoring.KeypointWeight != 0.8 || set.Scoring.SeverityWeight != 0.2 {
 		t.Fatalf("defaults not applied: %+v", set.Scoring)
+	}
+	if len(set.Cases) != 1 {
+		t.Fatalf("cases = %d", len(set.Cases))
+	}
+
+	// Explicit weights must survive loading untouched.
+	custom, err := LoadSet(strings.NewReader(`{"scoring":{"keypoint_weight":0.6,"severity_weight":0.4,"pass_threshold":0.5},"cases":[{"id":"E1","alert_id":"A1","expected_severity":"critical","keypoints":[{"id":"k1","any":["x"]}]}]}`))
+	if err != nil {
+		t.Fatalf("LoadSet(custom): %v", err)
+	}
+	if custom.Scoring.KeypointWeight != 0.6 || custom.Scoring.SeverityWeight != 0.4 {
+		t.Fatalf("configured weights were not read: %+v", custom.Scoring)
 	}
 
 	bad := map[string]string{
 		"empty":            `{"cases":[]}`,
+		"negative weight":  `{"scoring":{"keypoint_weight":-0.2},"cases":[{"id":"E1","alert_id":"A1","expected_severity":"info","keypoints":[{"id":"k","any":["x"]}]}]}`,
+		"weight above one": `{"scoring":{"severity_weight":1.5},"cases":[{"id":"E1","alert_id":"A1","expected_severity":"info","keypoints":[{"id":"k","any":["x"]}]}]}`,
 		"bad severity":     `{"cases":[{"id":"E1","alert_id":"A1","expected_severity":"nope","keypoints":[{"any":["x"]}]}]}`,
 		"no keypoints":     `{"cases":[{"id":"E1","alert_id":"A1","expected_severity":"info","keypoints":[]}]}`,
 		"no patterns":      `{"cases":[{"id":"E1","alert_id":"A1","expected_severity":"info","keypoints":[{"id":"k","any":[]}]}]}`,
@@ -90,12 +119,34 @@ func TestSummarizeAndReport(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	s = RenderReport(&buf, "mock", "mock://rules-v1", results, 0.75)
+	s = RenderReport(&buf, "mock", "mock://rules-v1", results, Scoring{KeypointWeight: 0.8, SeverityWeight: 0.2, PassThreshold: 0.75})
 	out := buf.String()
 	if !strings.Contains(out, "FAIL") || !strings.Contains(out, "错误 1") {
 		t.Errorf("report missing failure verdict:\n%s", out)
 	}
 	if !strings.Contains(out, "E2") || !strings.Contains(out, "timeout") {
 		t.Errorf("report missing failed case detail:\n%s", out)
+	}
+	if !strings.Contains(out, "weight 0.80") || !strings.Contains(out, "weight 0.20") {
+		t.Errorf("report does not print the scoring weights:\n%s", out)
+	}
+}
+
+// TestReportPrintsConfiguredWeights covers S3 end to end at the reporting layer:
+// tuning evalset weights must change both the score and the printed header.
+func TestReportPrintsConfiguredWeights(t *testing.T) {
+	results := []Result{{
+		CaseID: "E1", AlertID: "A1", Expected: domain.SeverityInfo, Actual: domain.SeverityInfo,
+		Hits: []Hit{{Hit: true}, {Hit: false}}, KeypointRate: 0.5, SeverityOK: true,
+		Score: 0.6*0.5 + 0.4*1,
+	}}
+	var buf bytes.Buffer
+	RenderReport(&buf, "mock", "m", results, Scoring{KeypointWeight: 0.6, SeverityWeight: 0.4, PassThreshold: 0.5})
+	out := buf.String()
+	t.Logf("report with 0.6/0.4 weights:\n%s", out)
+	for _, want := range []string{"weight 0.60", "weight 0.40", "阈值 0.50", "PASS"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q:\n%s", want, out)
+		}
 	}
 }

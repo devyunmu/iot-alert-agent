@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devyunmu/iot-alert-agent/data"
 	"github.com/devyunmu/iot-alert-agent/internal/domain"
 	"github.com/devyunmu/iot-alert-agent/internal/llm"
 )
@@ -43,14 +44,14 @@ func TestParseOutputToleratesFraming(t *testing.T) {
 		"fence":     "```json\n" + body + "\n```",
 		"prefix":    "这是分析结果：\n" + body + "\n请查收。",
 		"plain":     body,
-		"uppercase": `{"summary":"s","severity":"WARNING","actions":["a"]}`,
+		"uppercase": `{"summary":"s","severity":"WARNING","actions":["a"],"confidence":0.5}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			an, err := ParseOutput(raw)
 			if err != nil {
 				t.Fatalf("ParseOutput(%q): %v", raw, err)
 			}
-			if an.Severity != domain.SeverityWarning && name != "uppercase" {
+			if an.Severity != domain.SeverityWarning {
 				t.Errorf("severity = %s", an.Severity)
 			}
 		})
@@ -59,11 +60,15 @@ func TestParseOutputToleratesFraming(t *testing.T) {
 
 func TestParseOutputRejectsInvalid(t *testing.T) {
 	tests := map[string]string{
-		"not json":        "sorry, I cannot help",
-		"missing summary": `{"severity":"critical","actions":["a"]}`,
-		"bad severity":    `{"summary":"s","severity":"urgent","actions":["a"]}`,
-		"no actions":      `{"summary":"s","severity":"critical","actions":[]}`,
-		"blank actions":   `{"summary":"s","severity":"critical","actions":["  ","- "]}`,
+		"not json":              "sorry, I cannot help",
+		"missing summary":       `{"severity":"critical","actions":["a"],"confidence":0.5}`,
+		"bad severity":          `{"summary":"s","severity":"urgent","actions":["a"],"confidence":0.5}`,
+		"no actions":            `{"summary":"s","severity":"critical","actions":[],"confidence":0.5}`,
+		"blank actions":         `{"summary":"s","severity":"critical","actions":["  ","- "],"confidence":0.5}`,
+		"missing confidence":    `{"summary":"s","severity":"critical","actions":["a"]}`,
+		"confidence above one":  `{"summary":"s","severity":"critical","actions":["a"],"confidence":1.2}`,
+		"confidence below zero": `{"summary":"s","severity":"critical","actions":["a"],"confidence":-0.1}`,
+		"confidence not number": `{"summary":"s","severity":"critical","actions":["a"],"confidence":"high"}`,
 	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -74,8 +79,25 @@ func TestParseOutputRejectsInvalid(t *testing.T) {
 	}
 }
 
+// TestParseOutputErrorMessages pins the contract from README: a missing required
+// field or an out-of-range confidence must be reported, not silently repaired.
+func TestParseOutputErrorMessages(t *testing.T) {
+	cases := map[string]string{
+		`{"severity":"critical","actions":["a"],"confidence":0.5}`:             "summary is required",
+		`{"summary":"s","severity":"critical","confidence":0.5}`:               "action is required",
+		`{"summary":"s","severity":"critical","actions":["a"]}`:                "confidence is required",
+		`{"summary":"s","severity":"critical","actions":["a"],"confidence":3}`: "invalid confidence",
+	}
+	for raw, want := range cases {
+		_, err := ParseOutput(raw)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want %q", err, want)
+		}
+	}
+}
+
 func TestParseOutputNormalises(t *testing.T) {
-	raw := `{"summary":"  s  ","severity":"info","likely_causes":["c1","c1","","c2","c3","c4"],"actions":["- a1","a1","a2","a3","a4","a5"],"confidence":3}`
+	raw := `{"summary":"  s  ","severity":"info","likely_causes":["c1","c1","","c2","c3","c4"],"actions":["- a1","a1","a2","a3","a4","a5"],"confidence":1}`
 	an, err := ParseOutput(raw)
 	if err != nil {
 		t.Fatalf("ParseOutput: %v", err)
@@ -93,15 +115,16 @@ func TestParseOutputNormalises(t *testing.T) {
 		t.Errorf("action trimming failed: %q", an.Actions[0])
 	}
 	if an.Confidence != 1 {
-		t.Errorf("confidence = %v, want clamped 1", an.Confidence)
+		t.Errorf("confidence = %v, want 1", an.Confidence)
 	}
 
-	an, err = ParseOutput(`{"summary":"s","severity":"info","actions":["a"]}`)
+	// Zero is a legal, explicitly stated confidence and must be preserved.
+	an, err = ParseOutput(`{"summary":"s","severity":"info","actions":["a"],"confidence":0}`)
 	if err != nil {
-		t.Fatalf("ParseOutput without confidence: %v", err)
+		t.Fatalf("ParseOutput with zero confidence: %v", err)
 	}
-	if an.Confidence != 0.6 {
-		t.Errorf("default confidence = %v, want 0.6", an.Confidence)
+	if an.Confidence != 0 {
+		t.Errorf("confidence = %v, want 0", an.Confidence)
 	}
 }
 
@@ -115,6 +138,34 @@ func TestBuildPromptIncludesContext(t *testing.T) {
 		if !strings.Contains(user, want) {
 			t.Errorf("user prompt missing %q", want)
 		}
+	}
+}
+
+// TestPromptClockMatchesDataset guards S4: the scenario clock in the prompt must
+// equal the dataset's generated_at, otherwise an alert can be "seen" after now.
+func TestPromptClockMatchesDataset(t *testing.T) {
+	raw, err := data.FS.ReadFile("alerts.json")
+	if err != nil {
+		t.Fatalf("read alerts.json: %v", err)
+	}
+	var head struct {
+		GeneratedAt time.Time `json:"generated_at"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
+		t.Fatalf("decode generated_at: %v", err)
+	}
+	now, err := time.Parse(time.RFC3339, DatasetNow)
+	if err != nil {
+		t.Fatalf("parse DatasetNow: %v", err)
+	}
+	if !head.GeneratedAt.Equal(now) {
+		t.Fatalf("dataset generated_at %s != prompt now %s", head.GeneratedAt.Format(time.RFC3339), DatasetNow)
+	}
+
+	a, d := sampleAlert()
+	_, user := BuildPrompt(a, d)
+	if !strings.Contains(user, `"now":"`+DatasetNow+`"`) {
+		t.Errorf("user prompt does not carry the dataset clock: %s", user)
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/devyunmu/iot-alert-agent/internal/agent"
 	"github.com/devyunmu/iot-alert-agent/internal/domain"
 	"github.com/devyunmu/iot-alert-agent/internal/store"
@@ -24,6 +26,10 @@ type Service struct {
 	store    *store.Store
 	analyzer agent.Analyzer
 	timeout  time.Duration
+	// group collapses concurrent triage requests for the same alert into one
+	// upstream call. Without it a cold cache plus a burst of requests produced
+	// N identical /chat/completions calls and last-writer-wins cache entries.
+	group singleflight.Group
 }
 
 // New builds a Service. timeout bounds each LLM call.
@@ -79,17 +85,49 @@ func (s *Service) Ack(id, operator string) (domain.Alert, bool, error) {
 	return s.store.AckAlert(id, operator)
 }
 
+// Close moves an acknowledged alert to closed and stamps ClosedAt, so every
+// alert can reach the terminal state the board and timeline display.
+func (s *Service) Close(id string) (domain.Alert, bool, error) {
+	return s.store.CloseAlert(id)
+}
+
 // Analyze returns cached triage unless force is set. Only validated analyses are
 // cached, so a bad model response never poisons subsequent requests.
+//
+// Concurrent requests for the same alert share one in-flight analyzer call:
+// singleflight is keyed by alert id, and each caller re-checks the cache before
+// joining so a warm entry is never recomputed. The leader's context bounds the
+// shared call; a cancelled leader fails the batch and callers simply retry.
 func (s *Service) Analyze(ctx context.Context, id string, force bool) (domain.Analysis, error) {
-	a, err := s.store.GetAlert(id)
-	if err != nil {
-		return domain.Analysis{}, err
-	}
 	if !force {
 		if cached, ok := s.store.GetAnalysis(id); ok {
 			return cached, nil
 		}
+	}
+	v, err, _ := s.group.Do(id, func() (any, error) {
+		// A previous flight may have filled the cache between the check above
+		// and Do; re-reading here avoids a duplicate call in that window.
+		if !force {
+			if cached, ok := s.store.GetAnalysis(id); ok {
+				return cached, nil
+			}
+		}
+		return s.generate(ctx, id)
+	})
+	if err != nil {
+		return domain.Analysis{}, err
+	}
+	an, ok := v.(domain.Analysis)
+	if !ok {
+		return domain.Analysis{}, fmt.Errorf("analyze %s: unexpected result type %T", id, v)
+	}
+	return an, nil
+}
+
+func (s *Service) generate(ctx context.Context, id string) (domain.Analysis, error) {
+	a, err := s.store.GetAlert(id)
+	if err != nil {
+		return domain.Analysis{}, err
 	}
 	d, err := s.store.GetDevice(a.DeviceID)
 	if err != nil {

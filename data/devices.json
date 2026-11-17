@@ -8,9 +8,9 @@
       "model": "TH-200",
       "site": "园区A / 1号冷库",
       "firmware": "2.3.1",
-      "status": "online",
+      "status": "offline",
       "battery": 87,
-      "last_seen": "2026-11-17T07:58:00Z",
+      "last_seen": "2026-11-17T07:51:00Z",
       "tags": [
         "冷链",
         "温湿度",

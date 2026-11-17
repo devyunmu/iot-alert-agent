@@ -1,8 +1,12 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
+	"regexp"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/devyunmu/iot-alert-agent/data"
 	"github.com/devyunmu/iot-alert-agent/internal/domain"
@@ -52,6 +56,151 @@ func TestDatasetIntegrity(t *testing.T) {
 		if !seenTypes[typ] {
 			t.Errorf("dataset does not cover alert type %q", typ)
 		}
+	}
+}
+
+// datasetClock returns the scenario "now" declared by the fixtures. Every
+// timeline field must be relative to it; the prompt uses the same instant.
+func datasetClock(t *testing.T) time.Time {
+	t.Helper()
+	raw, err := data.FS.ReadFile("alerts.json")
+	if err != nil {
+		t.Fatalf("read alerts: %v", err)
+	}
+	var head struct {
+		GeneratedAt time.Time `json:"generated_at"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
+		t.Fatalf("decode generated_at: %v", err)
+	}
+	return head.GeneratedAt
+}
+
+// TestDatasetTimelineConsistency is the regression for S4: every timestamp in the
+// fixtures must sit on one consistent timeline (no ack/heartbeat after "now",
+// no closed status without closed_at, no duration that contradicts the fields).
+func TestDatasetTimelineConsistency(t *testing.T) {
+	s := newTestStore(t)
+	now := datasetClock(t)
+	if now.IsZero() {
+		t.Fatal("dataset has no generated_at")
+	}
+
+	shortForm := regexp.MustCompile(`(?:离线|中断)\s*(\d+)\s*分钟`)
+	longForm := regexp.MustCompile(`(?:离线|中断)\s*(\d+)\s*小时\s*(\d+)\s*分钟`)
+
+	for _, a := range s.ListAlerts(Filter{}) {
+		if a.LastSeen.Before(a.FirstSeen) {
+			t.Errorf("%s: last_seen before first_seen", a.ID)
+		}
+		if a.CreatedAt.After(now) || a.FirstSeen.After(now) || a.LastSeen.After(now) {
+			t.Errorf("%s: timestamp after dataset now %s", a.ID, now.Format(time.RFC3339))
+		}
+		if a.AckedAt != nil {
+			if a.AckedAt.Before(a.CreatedAt) || a.AckedAt.After(now) {
+				t.Errorf("%s: acked_at outside [created_at, now]", a.ID)
+			}
+		}
+		if a.ClosedAt != nil {
+			if a.ClosedAt.After(now) {
+				t.Errorf("%s: closed_at after now", a.ID)
+			}
+			if a.AckedAt != nil && a.ClosedAt.Before(*a.AckedAt) {
+				t.Errorf("%s: closed_at before acked_at", a.ID)
+			}
+		}
+		if a.Status == domain.StatusAcked && a.AckedAt == nil {
+			t.Errorf("%s: acked status without acked_at", a.ID)
+		}
+		if a.Status == domain.StatusClosed {
+			if a.ClosedAt == nil {
+				t.Errorf("%s: closed status without closed_at", a.ID)
+			}
+			if a.AckedAt == nil {
+				t.Errorf("%s: closed status without acked_at", a.ID)
+			}
+		}
+		if a.Status != domain.StatusClosed && a.ClosedAt != nil {
+			t.Errorf("%s: closed_at set while status is %s", a.ID, a.Status)
+		}
+
+		if a.Type != domain.TypeOffline {
+			continue
+		}
+		// Offline alerts follow one convention: first_seen is the last heartbeat,
+		// last_seen is the evaluation instant, and the device agrees with both.
+		if !a.LastSeen.Equal(now) {
+			t.Errorf("%s: offline alert last_seen %s != now %s", a.ID, a.LastSeen.Format(time.RFC3339), now.Format(time.RFC3339))
+		}
+		d, err := s.GetDevice(a.DeviceID)
+		if err != nil {
+			t.Errorf("%s: device: %v", a.ID, err)
+			continue
+		}
+		if !d.LastSeen.Equal(a.FirstSeen) {
+			t.Errorf("%s: device last_seen %s != alert first_seen %s", a.ID, d.LastSeen.Format(time.RFC3339), a.FirstSeen.Format(time.RFC3339))
+		}
+		if d.Status != "offline" {
+			t.Errorf("%s: offline alert on device with status %q", a.ID, d.Status)
+		}
+
+		var stated time.Duration
+		if m := longForm.FindStringSubmatch(a.Message); m != nil {
+			h, _ := strconv.Atoi(m[1])
+			min, _ := strconv.Atoi(m[2])
+			stated = time.Duration(h)*time.Hour + time.Duration(min)*time.Minute
+		} else if m := shortForm.FindStringSubmatch(a.Message); m != nil {
+			min, _ := strconv.Atoi(m[1])
+			stated = time.Duration(min) * time.Minute
+		} else {
+			t.Errorf("%s: offline message has no parsable duration: %q", a.ID, a.Message)
+			continue
+		}
+		if got := now.Sub(a.FirstSeen); got != stated {
+			t.Errorf("%s: message says %s offline, fields say %s", a.ID, stated, got)
+		}
+	}
+}
+
+func TestCloseLifecycle(t *testing.T) {
+	s := newTestStore(t)
+
+	// open → closed must be rejected: acknowledgement carries the audit trail.
+	if _, _, err := s.CloseAlert("ALT-0001"); !errors.Is(err, ErrNotAcked) {
+		t.Fatalf("close open alert err = %v, want ErrNotAcked", err)
+	}
+	if got, err := s.GetAlert("ALT-0001"); err != nil || got.Status != domain.StatusOpen || got.ClosedAt != nil {
+		t.Fatalf("rejected close mutated alert: %+v err=%v", got, err)
+	}
+
+	// acked → closed stamps ClosedAt and is idempotent.
+	if _, _, err := s.AckAlert("ALT-0001", "alice"); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	got, changed, err := s.CloseAlert("ALT-0001")
+	if err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if !changed || got.Status != domain.StatusClosed || got.ClosedAt == nil {
+		t.Fatalf("unexpected close result: %+v changed=%v", got, changed)
+	}
+	if got.ClosedAt.Before(*got.AckedAt) {
+		t.Errorf("closed_at %s before acked_at %s", got.ClosedAt, got.AckedAt)
+	}
+	again, changed, err := s.CloseAlert("ALT-0001")
+	if err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if changed || again.ClosedAt == nil || !again.ClosedAt.Equal(*got.ClosedAt) {
+		t.Fatalf("close should be idempotent: %+v changed=%v", again, changed)
+	}
+
+	// A pre-closed alert stays a no-op; a missing one is not found.
+	if a, changed, err := s.CloseAlert("ALT-0015"); err != nil || changed || a.Status != domain.StatusClosed {
+		t.Fatalf("pre-closed alert: %+v changed=%v err=%v", a, changed, err)
+	}
+	if _, _, err := s.CloseAlert("ALT-9999"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing alert close err = %v, want ErrNotFound", err)
 	}
 }
 

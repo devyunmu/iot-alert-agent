@@ -63,27 +63,27 @@ func TestEvalSet(t *testing.T) {
 	}
 
 	workers := envInt("EVAL_WORKERS", 3)
-	threshold := set.Scoring.PassThreshold
+	sc := set.Scoring
 	if v := os.Getenv("EVAL_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			t.Fatalf("invalid EVAL_THRESHOLD %q: %v", v, err)
 		}
-		threshold = f
+		sc.PassThreshold = f
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	start := time.Now()
 	results := eval.Run(ctx, an, st, set, workers)
-	summary := eval.RenderReport(os.Stdout, modeLabel, an.Describe(), results, threshold)
+	summary := eval.RenderReport(os.Stdout, modeLabel, an.Describe(), results, sc)
 	fmt.Printf("总耗时 %.1fs（并发 %d）\n\n", time.Since(start).Seconds(), workers)
 
 	if summary.Errors > 0 {
 		t.Errorf("%d/%d cases failed to produce a valid analysis", summary.Errors, summary.Cases)
 	}
-	if summary.AvgScore < threshold {
-		t.Errorf("average score %.3f below threshold %.2f", summary.AvgScore, threshold)
+	if summary.AvgScore < sc.PassThreshold {
+		t.Errorf("average score %.3f below threshold %.2f", summary.AvgScore, sc.PassThreshold)
 	}
 	if !summary.Passed {
 		t.Errorf("evaluation did not pass (errors=%d, avg=%.3f)", summary.Errors, summary.AvgScore)

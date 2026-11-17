@@ -80,12 +80,18 @@ const systemPrompt = `你是工业物联网平台的告警处置工程师。根�
 1. 只能使用输入中出现的事实，不得编造设备、数值、时间或客户信息。
 2. 处置建议要结合设备类型与告警类型：离线先查供电与链路；低电量先核对耗电曲线再安排更换；数值异常先做冗余比对排除传感器故障，再检查现场工况；OTA 失败先校验包完整性与升级前置条件；通信抖动先看信号质量与上联端口。
 3. 不要承诺"已修复"，只给出待执行的步骤。
-4. confidence 表示你对本次分析整体的把握，范围 0 到 1。`
+4. confidence 表示你对本次分析整体的把握，范围 0 到 1。
+5. summary、severity、actions、confidence 四个字段必须输出；confidence 缺失或越界都会被视为无效输出。`
+
+// DatasetNow is the fixed scenario clock shared with data/*.json (generated_at).
+// Using one explicit instant instead of time.Now keeps prompts reproducible and
+// prevents "last_seen is later than now" contradictions in the synthetic data.
+const DatasetNow = "2026-11-17T08:00:00Z"
 
 // BuildPrompt renders the system and user messages for one alert.
 func BuildPrompt(alert domain.Alert, device domain.Device) (string, string) {
 	payload := map[string]any{
-		"now": "2026-11-17T08:00:00Z",
+		"now": DatasetNow,
 		"device": map[string]any{
 			"id": device.ID, "name": device.Name, "model": device.Model,
 			"site": device.Site, "firmware": device.Firmware, "status": device.Status,
@@ -115,14 +121,17 @@ type outputDTO struct {
 	SeverityReason string   `json:"severity_reason"`
 	LikelyCauses   []string `json:"likely_causes"`
 	Actions        []string `json:"actions"`
-	Confidence     float64  `json:"confidence"`
+	// Pointer so an omitted field is distinguishable from an explicit 0.
+	Confidence *float64 `json:"confidence"`
 }
 
 var fenceRE = regexp.MustCompile("(?s)^```(?:json)?\\s*(.*?)\\s*```$")
 
 // ParseOutput extracts and validates the triage JSON from a model response.
 // Models occasionally wrap JSON in fences or add a sentence around it, so the
-// parser is tolerant about framing but strict about required fields.
+// parser is tolerant about framing but strict about the contract: summary,
+// severity, actions and confidence are required, and no value is silently
+// repaired — a malformed response fails the triage instead of reaching cache.
 func ParseOutput(raw string) (domain.Analysis, error) {
 	text := strings.TrimSpace(raw)
 	if m := fenceRE.FindStringSubmatch(text); m != nil {
@@ -155,15 +164,12 @@ func ParseOutput(raw string) (domain.Analysis, error) {
 		return domain.Analysis{}, fmt.Errorf("at least one action is required")
 	}
 
-	conf := dto.Confidence
-	if conf < 0 {
-		conf = 0
+	if dto.Confidence == nil {
+		return domain.Analysis{}, fmt.Errorf("confidence is required")
 	}
-	if conf > 1 {
-		conf = 1
-	}
-	if conf == 0 {
-		conf = 0.6 // absent confidence is common; do not treat it as zero certainty
+	conf := *dto.Confidence
+	if conf < 0 || conf > 1 {
+		return domain.Analysis{}, fmt.Errorf("invalid confidence %v: must be between 0 and 1", conf)
 	}
 
 	return domain.Analysis{

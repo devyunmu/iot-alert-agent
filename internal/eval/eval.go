@@ -36,16 +36,21 @@ type Case struct {
 	Keypoints        []Keypoint      `json:"keypoints"`
 }
 
+// Scoring is the weight/threshold block from the evalset. It is read from the
+// config file and used verbatim by Score and RenderReport so the report always
+// shows the weights that actually produced the numbers.
+type Scoring struct {
+	KeypointWeight float64 `json:"keypoint_weight"`
+	SeverityWeight float64 `json:"severity_weight"`
+	PassThreshold  float64 `json:"pass_threshold"`
+}
+
 // Set is the full evaluation file.
 type Set struct {
-	Version     int    `json:"version"`
-	Description string `json:"description"`
-	Scoring     struct {
-		KeypointWeight float64 `json:"keypoint_weight"`
-		SeverityWeight float64 `json:"severity_weight"`
-		PassThreshold  float64 `json:"pass_threshold"`
-	} `json:"scoring"`
-	Cases []Case `json:"cases"`
+	Version     int     `json:"version"`
+	Description string  `json:"description"`
+	Scoring     Scoring `json:"scoring"`
+	Cases       []Case  `json:"cases"`
 }
 
 // LoadSet decodes and validates an evaluation set.
@@ -67,6 +72,9 @@ func LoadSet(r io.Reader) (*Set, error) {
 	}
 	if s.Scoring.PassThreshold == 0 {
 		s.Scoring.PassThreshold = 0.75
+	}
+	if err := s.Scoring.Validate(); err != nil {
+		return nil, err
 	}
 	seen := make(map[string]bool, len(s.Cases))
 	for i := range s.Cases {
@@ -91,6 +99,24 @@ func LoadSet(r io.Reader) (*Set, error) {
 		}
 	}
 	return &s, nil
+}
+
+// Validate rejects nonsensical weights instead of silently producing a score
+// that cannot reach the threshold.
+func (sc Scoring) Validate() error {
+	if sc.KeypointWeight < 0 || sc.KeypointWeight > 1 {
+		return fmt.Errorf("scoring.keypoint_weight %.2f outside [0,1]", sc.KeypointWeight)
+	}
+	if sc.SeverityWeight < 0 || sc.SeverityWeight > 1 {
+		return fmt.Errorf("scoring.severity_weight %.2f outside [0,1]", sc.SeverityWeight)
+	}
+	if sc.KeypointWeight+sc.SeverityWeight == 0 {
+		return fmt.Errorf("scoring weights must not both be zero")
+	}
+	if sc.PassThreshold < 0 || sc.PassThreshold > 1 {
+		return fmt.Errorf("scoring.pass_threshold %.2f outside [0,1]", sc.PassThreshold)
+	}
+	return nil
 }
 
 // Hit records whether one keypoint was found and which pattern matched.
@@ -130,7 +156,7 @@ func Run(ctx context.Context, an agent.Analyzer, st *store.Store, set *Set, work
 	worker := func() {
 		defer wg.Done()
 		for idx := range jobs {
-			results[idx] = runOne(ctx, an, st, set.Cases[idx])
+			results[idx] = runOne(ctx, an, st, set.Cases[idx], set.Scoring)
 		}
 	}
 	for i := 0; i < workers; i++ {
@@ -145,7 +171,7 @@ func Run(ctx context.Context, an agent.Analyzer, st *store.Store, set *Set, work
 	return results
 }
 
-func runOne(ctx context.Context, an agent.Analyzer, st *store.Store, c Case) Result {
+func runOne(ctx context.Context, an agent.Analyzer, st *store.Store, c Case, sc Scoring) Result {
 	r := Result{CaseID: c.ID, AlertID: c.AlertID, Focus: c.Focus, Expected: c.ExpectedSeverity, Hits: make([]Hit, len(c.Keypoints))}
 	start := time.Now()
 
@@ -181,7 +207,7 @@ func runOne(ctx context.Context, an agent.Analyzer, st *store.Store, c Case) Res
 		}
 		r.Hits[i] = hit
 	}
-	r.KeypointRate, r.SeverityOK, r.Score = Score(r.Hits, an1.Severity, c.ExpectedSeverity)
+	r.KeypointRate, r.SeverityOK, r.Score = Score(r.Hits, an1.Severity, c.ExpectedSeverity, sc)
 	return r
 }
 
@@ -208,8 +234,10 @@ func stripSpace(s string) string {
 	return strings.NewReplacer(" ", "", "\t", "", "\n", "", "\u3000", "").Replace(s)
 }
 
-// Score combines keypoint recall (weight 0.8) with severity agreement (0.2).
-func Score(hits []Hit, actual, expected domain.Severity) (keypointRate float64, severityOK bool, score float64) {
+// Score combines keypoint recall with severity agreement using the weights from
+// the evalset (defaults: 0.8 and 0.2). Passing the weights in — instead of
+// hard-coding them — keeps the score honest when someone tunes the file.
+func Score(hits []Hit, actual, expected domain.Severity, sc Scoring) (keypointRate float64, severityOK bool, score float64) {
 	if len(hits) == 0 {
 		keypointRate = 1
 	} else {
@@ -222,7 +250,7 @@ func Score(hits []Hit, actual, expected domain.Severity) (keypointRate float64, 
 		keypointRate = float64(n) / float64(len(hits))
 	}
 	severityOK = actual == expected
-	score = 0.8*keypointRate + 0.2*boolFloat(severityOK)
+	score = sc.KeypointWeight*keypointRate + sc.SeverityWeight*boolFloat(severityOK)
 	return keypointRate, severityOK, score
 }
 
@@ -281,13 +309,16 @@ func Summarize(results []Result) Summary {
 }
 
 // RenderReport writes a human-readable score report and the pass/fail verdict.
-func RenderReport(w io.Writer, mode, analyzer string, results []Result, threshold float64) Summary {
+// The scoring line prints the weights actually used, so a tuned evalset cannot
+// silently disagree with the report.
+func RenderReport(w io.Writer, mode, analyzer string, results []Result, sc Scoring) Summary {
 	s := Summarize(results)
-	s.Passed = s.Errors == 0 && s.AvgScore >= threshold
+	s.Passed = s.Errors == 0 && s.AvgScore >= sc.PassThreshold
 
 	fmt.Fprintf(w, "\n=== IoT Alert Agent · 评测报告 ===\n")
 	fmt.Fprintf(w, "模式: %-8s 分析器: %-28s 用例: %d\n", mode, analyzer, len(results))
-	fmt.Fprintf(w, "评分: 要点命中 80%% + 严重度一致 20%%，通过阈值 %.2f\n", threshold)
+	fmt.Fprintf(w, "评分: 要点命中 %.0f%% (weight %.2f) + 严重度一致 %.0f%% (weight %.2f)，通过阈值 %.2f\n",
+		sc.KeypointWeight*100, sc.KeypointWeight, sc.SeverityWeight*100, sc.SeverityWeight, sc.PassThreshold)
 	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 78))
 	fmt.Fprintf(w, "%-7s %-10s %-6s %-4s %-7s %-6s %-8s\n", "CASE", "ALERT", "LEVEL", "SEV", "KEYPOINTS", "SCORE", "LATENCY")
 	for _, r := range results {
@@ -337,7 +368,7 @@ func RenderReport(w io.Writer, mode, analyzer string, results []Result, threshol
 	if !s.Passed {
 		verdict = "FAIL"
 	}
-	fmt.Fprintf(w, "结论: %s（阈值 %.2f，错误数 %d）\n\n", verdict, threshold, s.Errors)
+	fmt.Fprintf(w, "结论: %s（阈值 %.2f，错误数 %d）\n\n", verdict, sc.PassThreshold, s.Errors)
 	return s
 }
 

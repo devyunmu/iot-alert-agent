@@ -23,7 +23,7 @@
 ## 它做了什么
 
 - 内置 **30 条全合成告警 / 12 台合成设备**，覆盖 5 类真实故障：设备离线、低电量、传感器数值异常、OTA 失败、通信抖动。
-- 单页 Server-Side Rendering 值班台：告警列表、筛选、详情、设备档案、AI 处置建议、人工确认、处置时间线。
+- 单页 Server-Side Rendering 值班台：告警列表、筛选、详情、设备档案、AI 处置建议、人工确认/关闭、处置时间线。
 - **MCP server（stdio）** 暴露 4 个工具：`list_alerts` / `get_device` / `summarize_alert` / `ack_alert`，同一份领域逻辑同时服务 Web 和 Agent。
 - **评测集 + Go test runner**：要点命中评分、定级一致性、逐用例失败明细、通过阈值；LLM 不可达时可用 mock 模式跑通全链路。
 - 任意 OpenAI 兼容端点；base_url / api_key / model / token 预算全部来自环境变量，**无硬编码密钥**。
@@ -77,6 +77,8 @@ export LLM_TIMEOUT=180s
 go run ./cmd/server
 # http://127.0.0.1:8080
 ```
+
+默认只监听回环地址 `127.0.0.1:8080`：服务没有鉴权，绑定 `0.0.0.0` 会把告警读写接口暴露给整个局域网。确需局域网访问时显式覆盖，例如 `ADDR=0.0.0.0:8080`，并自行加访问控制。
 
 **零凭据演示**：不设置 `LLM_API_KEY` 时自动使用确定性规则分析器，页面顶部会显示 `MOCK · mock://rules-v1`，AI 卡片标注"规则回退"，不会把规则结果冒充模型输出。
 
@@ -148,10 +150,12 @@ npx @modelcontextprotocol/inspector ./bin/iot-mcp
 | `GET` | `/alerts/:id` | 告警详情 + AI 建议 |
 | `POST` | `/alerts/:id/analyze` | 生成 AI 建议（表单，`force=1` 重算） |
 | `POST` | `/alerts/:id/ack` | 确认告警（表单） |
+| `POST` | `/alerts/:id/close` | 关闭已确认告警（表单，写入 `closed_at`） |
 | `GET` | `/api/alerts` | 告警列表 JSON（支持 `limit`） |
 | `GET` | `/api/alerts/:id` | 详情 JSON（含缓存分析） |
 | `POST` | `/api/alerts/:id/analyze` | `{"force":true}` |
 | `POST` | `/api/alerts/:id/ack` | `{"operator":"..."}` |
+| `POST` | `/api/alerts/:id/close` | 关闭已确认告警，返回 `{alert, changed}` |
 | `GET` | `/api/stats` | 看板计数 + 当前分析器 |
 | `GET` | `/healthz` | 存活探针 |
 
@@ -163,6 +167,9 @@ curl -s -X POST http://127.0.0.1:8080/api/alerts/ALT-0021/analyze \
 
 curl -s -X POST http://127.0.0.1:8080/api/alerts/ALT-0006/ack \
   -H 'Content-Type: application/json' -d '{"operator":"oncall-li"}'
+
+# 关闭必须先确认；响应里 closed_at 即状态机闭环时间
+curl -s -X POST http://127.0.0.1:8080/api/alerts/ALT-0006/close | jq '.alert | {status, closed_at}'
 ```
 
 ## 评测：把"感觉还行"变成分数
@@ -175,10 +182,12 @@ curl -s -X POST http://127.0.0.1:8080/api/alerts/ALT-0006/ack \
 评分：
 
 ```
-用例得分 = 0.8 × 要点命中率 + 0.2 × 定级是否一致
+用例得分 = w_kp × 要点命中率 + w_sev × 定级是否一致
 总分     = 所有用例得分的平均值
-通过条件 = 平均分 ≥ 0.75 且 无分析错误
+通过条件 = 平均分 ≥ pass_threshold 且 无分析错误
 ```
+
+`w_kp` / `w_sev` / `pass_threshold` 直接取自 `evalset/evals.json` 的 `scoring` 块，缺省为 `0.8` / `0.2` / `0.75`。评测报告的表头会打印本次实际使用的权重，改配置后报告和分数不会脱节。
 
 运行：
 
@@ -198,7 +207,7 @@ EVAL_MODE=live LLM_MODEL=gpt-4o-mini EVAL_LIMIT=5 go test ./evalset -v
 
 ### 真实评测结果
 
-以下为 2026-11-17 的实际运行结果（`glm-5.3-flash`，14 条全量，并发 3）。LLM 输出存在随机性，不同模型/不同批次分数会有波动，因此评测结论应看趋势与失败类型，而不是单次小数点：
+以下为 2026-11-17 的实际运行结果（`glm-5.3-flash`，14 条全量，并发 3）。LLM 输出存在随机性，不同模型/不同批次分数会有波动，因此评测结论应看趋势与失败类型，而不是单次小数点。该次运行早于本次数据时间线与报告格式修正，评分口径仍为 0.8/0.2，EV-14 的漏检原因见下文：
 
 ```text
 === IoT Alert Agent · 评测报告 ===
@@ -241,7 +250,8 @@ EV-14   ALT-0030   warn   ✗    3/4       0.60   17080ms
 
 - **要点命中 93.3%**：事实引用（温度、电流、版本号、错误码）和领域动作（制冷机组、断路器、消防疏散）基本稳定，说明"设备档案 + 告警事件"的上下文组织是有效的。
 - **定级准确率 71.4%**：4 个分歧全部是**模型偏保守、把 warning 升成 critical**（OTA 校验和失败、网关通信抖动、污水 PH 超标、单设备离线 9 分钟）。对值班场景，过度定级会消耗人工注意力；下一步应把定级 rubric 拆成可判定的条件（业务中断时长 / 影响设备数 / 安全后果），并加入边界样例做少样本校准。
-- **四处要点漏检**：网关抖动未提"重传/丢包"、烟雾告警未给"通风/断电"、消防电池告警未提"备件/工单"、单设备离线未引用"9 分钟"。说明演练型 runbook 还需要在 prompt 中显式要求"同时给出止损动作与资源动作，并引用关键数值"。
+- **三处要点漏检**：网关抖动未提"重传/丢包"、烟雾告警未给"通风/断电"、消防电池告警未提"备件/工单"。说明演练型 runbook 还需要在 prompt 中显式要求"同时给出止损动作与资源动作"。
+- **EV-14 的"9 分钟"漏检是数据冲突 + 模型算术，不是 prompt 缺指令**：旧数据把 prompt 的 `now` 固定为 `08:00Z`，而 ALT-0030 的 `last_seen` 是 `08:07`、message 又写"离线 9 分钟"，按字段只能推出 2 分钟。模型面对互相矛盾的时间基准，既可能不引用时长，也可能算错。现已把整个数据集统一到 `08:00Z` 这一基准（`last_seen` 不晚于 `now`，离线时长 = `now - first_seen`），并用 `TestDatasetTimelineConsistency` 固化；归因从"prompt 没要求引用数值"改为"数据冲突 + 模型算术"。
 - **延迟 15–46s**：推理型模型在复杂用例上思考较长；并发 3 时全量约 2 分钟。作为异步分诊任务可接受，但不适合同步阻塞值班页面，生产上应改为任务队列 + 轮询/推送。
 - **零分析错误**：面对推理模型偶发的"预算耗尽、content 为空"，客户端会自动以 2 倍预算重试一次；该机制让本次 14 条全部产出有效 JSON。
 - **mock 模式 1.000 不代表模型能力**：规则回退的文案与评测要点同源，它只用于验证"评测链路能跑通"，报告中会明确标注 `mock://rules-v1`。
@@ -275,10 +285,10 @@ EV-14   ALT-0030   warn   ✗    3/4       0.60   17080ms
 
 ## 设计取舍
 
-- **Go + Gin，而不是 Python/LangChain**：目标是展示 Agent 能力可以长在平台工程里——单二进制部署、强类型、标准库 HTTP 客户端、无框架黑盒。整个项目只有两个直接依赖：`gin` 与 `mark3labs/mcp-go`。
+- **Go + Gin，而不是 Python/LangChain**：目标是展示 Agent 能力可以长在平台工程里——单二进制部署、强类型、标准库 HTTP 客户端、无框架黑盒。直接依赖只有三个：`gin`、`mark3labs/mcp-go` 和标准库补充件 `golang.org/x/sync`（并发请求合并）。
 - **内存仓储**：演示要一条命令启动且结果可复现；`store` 接口边界清晰，替换 SQLite/Postgres 不需要改上层。代价是进程重启后确认状态与分析缓存丢失（见 TODO）。
 - **空响应重试**：推理模型偶尔把预算耗在 reasoning 上，客户端检测到空 content 时自动以 2 倍预算重试一次（上限 16k），仍失败才向上抛错，避免整条分诊因一次坏采样而失败。
-- **严格输出契约**：模型必须返回 `summary / severity / severity_reason / likely_causes / actions / confidence`；缺字段、级别非法、动作为空一律报错，不猜测、不落缓存。
+- **严格输出契约**：`summary` / `severity` / `actions` / `confidence` 为必填；`severity_reason` / `likely_causes` 可选。缺字段、级别非法、动作为空、confidence 缺失或不在 `[0,1]` 一律报错并且不写缓存——不做静默修正，也不猜测默认值。
 - **MCP 错误语义**：找不到设备/告警、非法枚举、确认已关闭告警，均返回 `isError` 工具结果，让 Agent 能读到原因并自我纠正。
 - **规则回退可见**：无 key 或显式 `LLM_MOCK=1` 时使用规则分析器，UI、API、评测报告都带 `mock` 标记。
 - **合成数据**：设备号、站点、固件版本、错误码全部虚构，仓库不含任何真实客户、设备或公司信息。
@@ -293,18 +303,20 @@ go test -race ./...          # 通过（mock 模式）
 
 覆盖的关键路径：
 
-- 数据集完整性：30 告警、12 设备、5 类告警、设备引用完整；
+- 数据集完整性：30 告警、12 设备、5 类告警、设备引用完整；全部时间戳落在同一基准时间线上（无 `last_seen > now`、无缺 `closed_at` 的 closed 状态、离线时长与字段推算一致）；
 - 告警排序/筛选/搜索、确认幂等、已关闭冲突、空操作人兜底；
-- 模型输出：正常、带 Markdown 围栏、前后缀噪声、缺字段、非法级别、置信度截断；
+- 状态机：open → acked → closed，关闭写 `closed_at`、重复关闭幂等、未确认不可关闭；
+- 模型输出：正常、带 Markdown 围栏、前后缀噪声、缺字段、非法级别、confidence 缺失/越界/非数字；
+- 并发分诊：6 个冷缓存并发请求只触发 1 次上游 `/chat/completions`；
 - LLM 客户端：鉴权头、非 2xx、空 choices、空 content、超时；
-- Web：列表渲染、筛选、详情、分析缓存、确认、404、API JSON；
+- Web：列表渲染、筛选、详情、分析缓存、确认、关闭、404、API JSON；
 - MCP：`tools/list` 工具面、四个工具的调用结果、非法参数、重复确认；
-- 评测：要点匹配（忽略大小写与空白）、评分权重、报告 PASS/FAIL。
+- 评测：要点匹配（忽略大小写与空白）、可配置评分权重、报告打印实际权重与 PASS/FAIL。
 
 ## 局限与 TODO
 
 - [ ] 持久化：告警确认状态与分析缓存目前只在内存，重启即重置；接 SQLite/Postgres 并保留审计表。
-- [ ] 鉴权与多租户：当前是本地演示服务，无登录/RBAC；公开部署前必须加。
+- [ ] 鉴权与多租户：当前是本地演示服务，无登录/RBAC，因此默认只监听 `127.0.0.1`；公开部署前必须加鉴权并显式设置 `ADDR`。
 - [ ] 同步分析 → 异步任务：推理模型 30s+，应改为队列 + 前端轮询/SSE，避免阻塞请求。
 - [ ] MCP 传输：目前 stdio；补充 Streamable HTTP/SSE 以支持远程 Agent 与多客户端。
 - [ ] Prompt 版本化：把 prompt/rubric 纳入评测基线，CI 中对分数回退设门禁。

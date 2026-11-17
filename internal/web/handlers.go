@@ -87,6 +87,8 @@ func (h *handlers) index(c *gin.Context) {
 	switch c.Query("ok") {
 	case "acked":
 		d.Notice = "告警已确认"
+	case "closed":
+		d.Notice = "告警已关闭"
 	case "analyzed":
 		d.Notice = "AI 处置建议已生成"
 	}
@@ -110,6 +112,8 @@ func (h *handlers) detail(c *gin.Context) {
 	switch c.Query("ok") {
 	case "acked":
 		d.Notice = "告警已确认"
+	case "closed":
+		d.Notice = "告警已关闭"
 	case "analyzed":
 		d.Notice = "AI 处置建议已生成"
 	}
@@ -130,6 +134,14 @@ func (h *handlers) ack(c *gin.Context) {
 		return
 	}
 	c.Redirect(http.StatusSeeOther, "/alerts/"+c.Param("id")+"?ok=acked")
+}
+
+func (h *handlers) closeAlert(c *gin.Context) {
+	if _, _, err := h.deps.Service.Close(c.Param("id")); err != nil {
+		h.renderDetailError(c, err)
+		return
+	}
+	c.Redirect(http.StatusSeeOther, "/alerts/"+c.Param("id")+"?ok=closed")
 }
 
 func (h *handlers) analyzePage(c *gin.Context) {
@@ -154,6 +166,9 @@ func (h *handlers) renderDetailError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, store.ErrClosed):
 		d.Error = "该告警已关闭，无法执行此操作"
+		c.HTML(http.StatusConflict, "detail.html", d)
+	case errors.Is(err, store.ErrNotAcked):
+		d.Error = "请先确认告警，再执行关闭"
 		c.HTML(http.StatusConflict, "detail.html", d)
 	case errors.Is(err, store.ErrNotFound):
 		d.Error = "告警不存在"
@@ -238,6 +253,15 @@ func (h *handlers) apiAck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"alert": a, "changed": changed})
 }
 
+func (h *handlers) apiClose(c *gin.Context) {
+	a, changed, err := h.deps.Service.Close(c.Param("id"))
+	if err != nil {
+		apiError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"alert": a, "changed": changed})
+}
+
 type analyzeBody struct {
 	Force bool `json:"force"`
 }
@@ -272,6 +296,8 @@ func apiError(c *gin.Context, err error) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 	case errors.Is(err, store.ErrClosed):
 		c.JSON(http.StatusConflict, gin.H{"error": "alert is closed"})
+	case errors.Is(err, store.ErrNotAcked):
+		c.JSON(http.StatusConflict, gin.H{"error": "alert must be acknowledged before closing"})
 	case errors.Is(err, context.DeadlineExceeded):
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "AI analysis timed out"})
 	default:

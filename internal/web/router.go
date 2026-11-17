@@ -70,6 +70,7 @@ func NewRouter(d Deps) (*gin.Engine, error) {
 	r.GET("/", h.index)
 	r.GET("/alerts/:id", h.detail)
 	r.POST("/alerts/:id/ack", h.ack)
+	r.POST("/alerts/:id/close", h.closeAlert)
 	r.POST("/alerts/:id/analyze", h.analyzePage)
 
 	r.GET("/healthz", h.health)
@@ -78,6 +79,7 @@ func NewRouter(d Deps) (*gin.Engine, error) {
 		api.GET("/alerts", h.apiList)
 		api.GET("/alerts/:id", h.apiDetail)
 		api.POST("/alerts/:id/ack", h.apiAck)
+		api.POST("/alerts/:id/close", h.apiClose)
 		api.POST("/alerts/:id/analyze", h.apiAnalyze)
 		api.GET("/stats", h.apiStats)
 	}

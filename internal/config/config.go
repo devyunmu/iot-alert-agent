@@ -25,9 +25,13 @@ type Config struct {
 // Load reads configuration from the environment, applying demo-friendly
 // defaults. The default endpoint points at a local OpenAI-compatible gateway;
 // it is not a credential and can be overridden with LLM_BASE_URL.
+//
+// The HTTP listener defaults to loopback. The service has no authentication, so
+// binding 0.0.0.0 would expose the API to the whole LAN; operators who really
+// want that must opt in explicitly with ADDR.
 func Load() Config {
 	c := Config{
-		Addr:        env("ADDR", ":8080"),
+		Addr:        env("ADDR", "127.0.0.1:8080"),
 		BaseURL:     strings.TrimRight(env("LLM_BASE_URL", "http://127.0.0.1:3000/v1"), "/"),
 		APIKey:      firstNonEmpty(os.Getenv("LLM_API_KEY"), os.Getenv("OPENAI_API_KEY")),
 		Model:       env("LLM_MODEL", "gpt-4o-mini"),
