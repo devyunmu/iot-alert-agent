@@ -25,6 +25,11 @@ type Keypoint struct {
 	ID   string   `json:"id"`
 	Desc string   `json:"desc"`
 	Any  []string `json:"any"`
+	// RequiresInference marks a point that cannot be produced by copying the
+	// alert text (e.g. "escalate because cold-chain monitoring is about to go
+	// blind"). Echoing title/message earns no credit for such a point, which
+	// keeps the score from rewarding restatement.
+	RequiresInference bool `json:"requires_inference"`
 }
 
 // Case is one labelled alert.
@@ -121,10 +126,14 @@ func (sc Scoring) Validate() error {
 
 // Hit records whether one keypoint was found and which pattern matched.
 type Hit struct {
-	ID      string `json:"id"`
-	Desc    string `json:"desc"`
-	Hit     bool   `json:"hit"`
-	Matched string `json:"matched,omitempty"`
+	ID        string `json:"id"`
+	Desc      string `json:"desc"`
+	Hit       bool   `json:"hit"`
+	Matched   string `json:"matched,omitempty"`
+	Inference bool   `json:"inference"`
+	// Echoable means the alert's own title/message already satisfy this
+	// keypoint: any hit on it may be restatement rather than triage.
+	Echoable bool `json:"echoable"`
 }
 
 // Result is the outcome for one case.
@@ -185,7 +194,9 @@ func runOne(ctx context.Context, an agent.Analyzer, st *store.Store, c Case, sc 
 		r.Err = "load device: " + err.Error()
 		return r
 	}
-	callCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	// A case budget covers three attempts of the documented 4-minute endpoint
+	// timeout; retries must not inherit an exhausted first attempt.
+	callCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
 	defer cancel()
 	an1, err := an.Analyze(callCtx, alert, device)
 	r.LatencyMS = time.Since(start).Milliseconds()
@@ -196,14 +207,21 @@ func runOne(ctx context.Context, an agent.Analyzer, st *store.Store, c Case, sc 
 	r.Actual = an1.Severity
 	r.SummaryText = an1.Summary
 	text := matchText(an1)
+	source := sourceText(alert)
 	for i, kp := range c.Keypoints {
-		hit := Hit{ID: kp.ID, Desc: kp.Desc}
+		hit := Hit{ID: kp.ID, Desc: kp.Desc, Inference: kp.RequiresInference, Echoable: anyMatch(source, kp.Any)}
 		for _, pattern := range kp.Any {
-			if matches(text, pattern) {
-				hit.Hit = true
-				hit.Matched = pattern
-				break
+			if !matches(text, pattern) {
+				continue
 			}
+			// An inference point matched by a phrase that is also present in
+			// the alert text is restatement, not judgement: no credit.
+			if kp.RequiresInference && matches(source, pattern) {
+				continue
+			}
+			hit.Hit = true
+			hit.Matched = pattern
+			break
 		}
 		r.Hits[i] = hit
 	}
@@ -217,18 +235,75 @@ func matchText(a domain.Analysis) string {
 	return strings.ToLower(strings.Join(parts, "\n"))
 }
 
+// sourceText is what the model was given about the alert itself; anything
+// matched here can be produced by copying, without triage reasoning.
+func sourceText(a domain.Alert) string {
+	return strings.ToLower(a.Title + "\n" + a.Message)
+}
+
+func anyMatch(text string, patterns []string) bool {
+	for _, p := range patterns {
+		if matches(text, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Matches is the exported form used by evalset guards that check a keypoint is
+// not satisfiable by the raw alert text.
+func Matches(text, pattern string) bool { return matches(text, pattern) }
+
 // matches compares case-insensitively, ignoring whitespace so "25 A" and "25A"
-// are equivalent. Chinese text is unaffected by lowercasing.
+// are equivalent. Numeric patterns are matched on a boundary: "8.5" must not
+// hit "18.5", "87" must not hit "187", and "1.9.0" must not hit "11.9.0".
+// Chinese text is unaffected by lowercasing.
 func matches(text, pattern string) bool {
 	p := strings.ToLower(strings.TrimSpace(pattern))
 	if p == "" {
 		return false
 	}
-	if strings.Contains(text, p) {
+	t := strings.ToLower(text)
+	if strings.ContainsAny(p, "0123456789") {
+		if containsBounded(t, p) {
+			return true
+		}
+		ts, ps := stripSpace(t), stripSpace(p)
+		if ts == t && ps == p {
+			return false
+		}
+		return containsBounded(ts, ps)
+	}
+	if strings.Contains(t, p) {
 		return true
 	}
-	return strings.Contains(stripSpace(text), stripSpace(p))
+	return strings.Contains(stripSpace(t), stripSpace(p))
 }
+
+// containsBounded finds p in text and requires that every numeric edge of the
+// pattern is not glued to another digit or decimal point.
+func containsBounded(text, p string) bool {
+	for from := 0; from+len(p) <= len(text); {
+		i := strings.Index(text[from:], p)
+		if i < 0 {
+			return false
+		}
+		i += from
+		j := i + len(p)
+		leftOK := !isDigit(p[0]) || i == 0 || !isNumericByte(text[i-1])
+		rightOK := !isDigit(p[len(p)-1]) || j == len(text) || !isNumericByte(text[j])
+		if leftOK && rightOK {
+			return true
+		}
+		from = i + 1
+	}
+	return false
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+// isNumericByte treats '.' as numeric so "8.5" also rejects "8.55".
+func isNumericByte(b byte) bool { return isDigit(b) || b == '.' }
 
 func stripSpace(s string) string {
 	return strings.NewReplacer(" ", "", "\t", "", "\n", "", "\u3000", "").Replace(s)
@@ -270,7 +345,17 @@ type Summary struct {
 	KeypointRate     float64 `json:"keypoint_rate"`
 	SeverityAccuracy float64 `json:"severity_accuracy"`
 	AvgScore         float64 `json:"avg_score"`
-	Passed           bool    `json:"passed"`
+	// Inference vs replication split, so restatement cannot hide inside one
+	// aggregate recall number.
+	Inference       int `json:"inference_keypoints"`
+	InferenceHits   int `json:"inference_hits"`
+	Replication     int `json:"replication_keypoints"`
+	ReplicationHits int `json:"replication_hits"`
+	// Echoable counts keypoints whose patterns already appear in the alert
+	// text: an upper bound on what copying title/message could score.
+	Echoable int     `json:"echoable_keypoints"`
+	EchoRate float64 `json:"echo_keypoint_rate"`
+	Passed   bool    `json:"passed"`
 }
 
 // Summarize aggregates results; errored cases score zero but are excluded from
@@ -293,6 +378,20 @@ func Summarize(results []Result) Summary {
 			if h.Hit {
 				s.Hits++
 			}
+			if h.Inference {
+				s.Inference++
+				if h.Hit {
+					s.InferenceHits++
+				}
+			} else {
+				s.Replication++
+				if h.Hit {
+					s.ReplicationHits++
+				}
+			}
+			if h.Echoable {
+				s.Echoable++
+			}
 		}
 		sum += r.Score
 	}
@@ -301,6 +400,7 @@ func Summarize(results []Result) Summary {
 	}
 	if s.Keypoints > 0 {
 		s.KeypointRate = float64(s.Hits) / float64(s.Keypoints)
+		s.EchoRate = float64(s.Echoable) / float64(s.Keypoints)
 	}
 	if sevN > 0 {
 		s.SeverityAccuracy = float64(sevOK) / float64(sevN)
@@ -317,7 +417,7 @@ func RenderReport(w io.Writer, mode, analyzer string, results []Result, sc Scori
 
 	fmt.Fprintf(w, "\n=== IoT Alert Agent · 评测报告 ===\n")
 	fmt.Fprintf(w, "模式: %-8s 分析器: %-28s 用例: %d\n", mode, analyzer, len(results))
-	fmt.Fprintf(w, "评分: 要点命中 %.0f%% (weight %.2f) + 严重度一致 %.0f%% (weight %.2f)，通过阈值 %.2f\n",
+	fmt.Fprintf(w, "评分: 要点命中 %.0f%% (weight %.2f) + 定级准确率（模型 vs 规则基线）%.0f%% (weight %.2f)，通过阈值 %.2f\n",
 		sc.KeypointWeight*100, sc.KeypointWeight, sc.SeverityWeight*100, sc.SeverityWeight, sc.PassThreshold)
 	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 78))
 	fmt.Fprintf(w, "%-7s %-10s %-6s %-4s %-7s %-6s %-8s\n", "CASE", "ALERT", "LEVEL", "SEV", "KEYPOINTS", "SCORE", "LATENCY")
@@ -342,8 +442,12 @@ func RenderReport(w io.Writer, mode, analyzer string, results []Result, sc Scori
 	}
 
 	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 78))
-	fmt.Fprintf(w, "要点命中率 %.3f (%d/%d) · 定级准确率 %.3f · 平均得分 %.3f · 错误 %d\n",
-		s.KeypointRate, s.Hits, s.Keypoints, s.SeverityAccuracy, s.AvgScore, s.Errors)
+	fmt.Fprintf(w, "要点命中率 %.3f (%d/%d) · 推理要点 %d/%d · 复读要点 %d/%d · 定级准确率 %.3f · 平均得分 %.3f · 错误 %d\n",
+		s.KeypointRate, s.Hits, s.Keypoints,
+		s.InferenceHits, s.Inference, s.ReplicationHits, s.Replication,
+		s.SeverityAccuracy, s.AvgScore, s.Errors)
+	fmt.Fprintf(w, "可复读要点 %d/%d (%.0f%%)：仅抄告警 title/message 即可命中，不反映分诊能力；推理要点按 requires_inference 单独计分\n",
+		s.Echoable, s.Keypoints, s.EchoRate*100)
 
 	var misses []string
 	for _, r := range results {

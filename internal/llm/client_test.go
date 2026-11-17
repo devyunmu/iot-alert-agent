@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -137,5 +138,91 @@ func TestChatTimeout(t *testing.T) {
 	c := New(srv.URL, "sk-test", "m", 30*time.Millisecond, 10, 0)
 	if _, err := c.Chat(context.Background(), "s", "u"); err == nil {
 		t.Fatal("expected timeout error")
+	}
+}
+
+// TestChatSendsExplicitZeroTemperature is the P1-1 regression: temperature=0
+// means deterministic sampling and must reach the wire, not vanish thanks to
+// omitempty (which silently left the server default in charge).
+func TestChatSendsExplicitZeroTemperature(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "sk-test", "m", 2*time.Second, 64, 0)
+	if _, err := c.Chat(context.Background(), "s", "u"); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if !strings.Contains(string(raw), `"temperature":0`) {
+		t.Fatalf("request body dropped temperature=0: %s", raw)
+	}
+}
+
+// TestChatRetriesOn429ThenSucceeds covers the P1-2 backoff retry.
+func TestChatRetriesOn429ThenSucceeds(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"after backoff"}}]}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "sk-test", "m", 2*time.Second, 64, 0)
+	out, err := c.Chat(context.Background(), "s", "u")
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if out != "after backoff" || atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("out=%q calls=%d, want one retry then success", out, calls)
+	}
+}
+
+func TestChatDoesNotRetryClientErrors(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"message":"invalid token"}}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "sk-test", "m", 2*time.Second, 64, 0)
+	if _, err := c.Chat(context.Background(), "s", "u"); err == nil {
+		t.Fatal("expected error")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("calls = %d, want 1: 401 must not be retried", got)
+	}
+}
+
+// TestRetryGetsFreshAttemptBudget proves retries do not consume the first
+// attempt's timeout: the first attempt fails fast, then the retry is allowed
+// its own per-attempt budget.
+func TestRetryGetsFreshAttemptBudget(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		time.Sleep(60 * time.Millisecond) // fits the per-attempt budget, not a leftover one
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"second attempt"}}]}`)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "sk-test", "m", 100*time.Millisecond, 64, 0)
+	out, err := c.Chat(context.Background(), "s", "u")
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if out != "second attempt" {
+		t.Fatalf("out = %q", out)
 	}
 }

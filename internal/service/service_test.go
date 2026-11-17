@@ -52,6 +52,34 @@ func (f *fakeAnalyzer) callCount() int {
 	return f.calls
 }
 
+// blockingAnalyzer lets a test hold a flight open and decide when it finishes.
+type blockingAnalyzer struct {
+	calls   int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingAnalyzer() *blockingAnalyzer {
+	return &blockingAnalyzer{entered: make(chan struct{}, 4), release: make(chan struct{})}
+}
+
+func (b *blockingAnalyzer) Analyze(ctx context.Context, a domain.Alert, _ domain.Device) (domain.Analysis, error) {
+	atomic.AddInt32(&b.calls, 1)
+	b.entered <- struct{}{}
+	select {
+	case <-b.release:
+		return domain.Analysis{
+			AlertID: a.ID, Summary: "blocked result", Severity: a.Severity,
+			Actions: []string{"a"}, Model: "blocking", GeneratedAt: time.Now().UTC(),
+		}, nil
+	case <-ctx.Done():
+		return domain.Analysis{}, ctx.Err()
+	}
+}
+
+func (b *blockingAnalyzer) Describe() string { return "blocking" }
+func (b *blockingAnalyzer) Mock() bool       { return true }
+
 func newService(t *testing.T) (*Service, *store.Store, *fakeAnalyzer) {
 	t.Helper()
 	alerts, err := data.FS.ReadFile("alerts.json")
@@ -171,6 +199,129 @@ func TestAnalyzeSingleflightCollapsesBurst(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
 		t.Errorf("warm cache caused another upstream call: %d", got)
+	}
+}
+
+func newServiceWith(t *testing.T, an agent.Analyzer) *Service {
+	t.Helper()
+	alerts, err := data.FS.ReadFile("alerts.json")
+	if err != nil {
+		t.Fatalf("read alerts: %v", err)
+	}
+	devices, err := data.FS.ReadFile("devices.json")
+	if err != nil {
+		t.Fatalf("read devices: %v", err)
+	}
+	st, err := store.New(alerts, devices)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	return New(st, an, 2*time.Second)
+}
+
+// TestForceDoesNotJoinInFlightNonForcedCall is the S-1 regression: a forced
+// refresh arriving while a normal request is in flight must reach the analyzer
+// itself, not silently receive the in-flight (cache-serving) result.
+func TestForceDoesNotJoinInFlightNonForcedCall(t *testing.T) {
+	an := newBlockingAnalyzer()
+	svc := newServiceWith(t, an)
+
+	done := make(chan error, 2)
+	go func() {
+		_, err := svc.Analyze(context.Background(), "ALT-0001", false)
+		done <- err
+	}()
+	<-an.entered // normal flight is now running
+
+	go func() {
+		_, err := svc.Analyze(context.Background(), "ALT-0001", true)
+		done <- err
+	}()
+	select {
+	case <-an.entered:
+	case <-time.After(time.Second):
+		t.Fatal("forced request joined the non-forced flight instead of calling upstream")
+	}
+
+	close(an.release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&an.calls); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (one normal + one forced)", got)
+	}
+}
+
+// TestCancelledLeaderDoesNotCancelFollower is the S-2 regression: one caller
+// disconnecting (browser tab closed, MCP timeout) must not fail everyone else
+// waiting on the same shared call.
+func TestCancelledLeaderDoesNotCancelFollower(t *testing.T) {
+	an := newBlockingAnalyzer()
+	svc := newServiceWith(t, an)
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := svc.Analyze(leaderCtx, "ALT-0001", false)
+		leaderErr <- err
+	}()
+	<-an.entered
+
+	followerErr := make(chan error, 1)
+	go func() {
+		_, err := svc.Analyze(context.Background(), "ALT-0001", false)
+		followerErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let the follower join the flight
+	cancelLeader()
+
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader err = %v, want context.Canceled", err)
+	}
+	close(an.release)
+	if err := <-followerErr; err != nil {
+		t.Fatalf("follower inherited the leader's cancellation: %v", err)
+	}
+	if got := atomic.LoadInt32(&an.calls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (follower must join, not re-call)", got)
+	}
+}
+
+// TestWaiterHonoursOwnContext proves a waiter can give up on its own request
+// while the shared flight keeps running for the others.
+func TestWaiterHonoursOwnContext(t *testing.T) {
+	an := newBlockingAnalyzer()
+	svc := newServiceWith(t, an)
+
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := svc.Analyze(context.Background(), "ALT-0001", false)
+		leaderErr <- err
+	}()
+	<-an.entered
+
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiterErr := make(chan error, 1)
+	go func() {
+		_, err := svc.Analyze(waiterCtx, "ALT-0001", false)
+		waiterErr <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancelWaiter()
+
+	select {
+	case err := <-waiterErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiter err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter ignored its own cancellation")
+	}
+	close(an.release)
+	if err := <-leaderErr; err != nil {
+		t.Fatalf("leader failed after waiter left: %v", err)
 	}
 }
 

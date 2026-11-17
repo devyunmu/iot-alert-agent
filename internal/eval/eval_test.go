@@ -2,11 +2,14 @@ package eval
 
 import (
 	"bytes"
+	"context"
 	"math"
 	"strings"
 	"testing"
 
+	"github.com/devyunmu/iot-alert-agent/data"
 	"github.com/devyunmu/iot-alert-agent/internal/domain"
+	"github.com/devyunmu/iot-alert-agent/internal/store"
 )
 
 func TestScore(t *testing.T) {
@@ -57,6 +60,102 @@ func TestMatchesIgnoresWhitespaceAndCase(t *testing.T) {
 		if got := matches(text, pattern); got != want {
 			t.Errorf("matches(%q) = %v, want %v", pattern, got, want)
 		}
+	}
+}
+
+func TestMatchesNumericBoundaries(t *testing.T) {
+	cases := []struct {
+		text, pattern string
+		want          bool
+	}{
+		{"电流达到 18.5 A", "8.5", false},
+		{"设备已离线 187 分钟", "87", false},
+		{"PH 值 19.4 异常", "9.4", false},
+		{"版本 11.9.0", "1.9.0", false},
+		{"浓度 10.42", "0.42", false},
+		{"电流 8.5 A", "8.5", true},
+		{"离线 87 分钟", "87", true},
+		{"0.35V", "0.35", true},
+		{"总时长 236 分钟", "36 分钟", false},
+		{"断连 112 次", "12 次", false},
+		{"断连 12次", "12 次", true},
+		{"额定 25 A", "25A", true},
+		{"偏差 8.55", "8.5", false},
+	}
+	for _, tc := range cases {
+		if got := Matches(tc.text, tc.pattern); got != tc.want {
+			t.Errorf("Matches(%q, %q) = %v, want %v", tc.text, tc.pattern, got, tc.want)
+		}
+	}
+}
+
+type stubAnalyzer struct{ out domain.Analysis }
+
+func (s stubAnalyzer) Analyze(context.Context, domain.Alert, domain.Device) (domain.Analysis, error) {
+	return s.out, nil
+}
+func (s stubAnalyzer) Describe() string { return "stub" }
+func (s stubAnalyzer) Mock() bool       { return true }
+
+// TestInferenceKeypointRejectsRestatement: a requires_inference point whose
+// pattern also exists in the alert text earns nothing when echoed back.
+func TestInferenceKeypointRejectsRestatement(t *testing.T) {
+	alerts, err := data.FS.ReadFile("alerts.json")
+	if err != nil {
+		t.Fatalf("read alerts: %v", err)
+	}
+	devices, err := data.FS.ReadFile("devices.json")
+	if err != nil {
+		t.Fatalf("read devices: %v", err)
+	}
+	st, err := store.New(alerts, devices)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	c := Case{
+		ID: "T1", AlertID: "ALT-0030", ExpectedSeverity: domain.SeverityWarning,
+		Keypoints: []Keypoint{
+			{ID: "echo", Desc: "copied duration", Any: []string{"9 分钟"}, RequiresInference: true},
+			{ID: "infer", Desc: "blind spot", Any: []string{"监测盲区"}, RequiresInference: true},
+			{ID: "copy", Desc: "copied fact", Any: []string{"离线"}, RequiresInference: false},
+		},
+	}
+	an := stubAnalyzer{out: domain.Analysis{
+		AlertID: "ALT-0030", Summary: "设备离线 9 分钟，存在冷链监测盲区",
+		Severity: domain.SeverityWarning, Actions: []string{"check"},
+	}}
+	r := runOne(context.Background(), an, st, c, Scoring{KeypointWeight: 0.8, SeverityWeight: 0.2, PassThreshold: 0.75})
+	if r.Hits[0].Hit || !r.Hits[0].Echoable || !r.Hits[0].Inference {
+		t.Errorf("echoed inference point was credited: %+v", r.Hits[0])
+	}
+	if !r.Hits[1].Hit {
+		t.Errorf("genuine inference point should hit: %+v", r.Hits[1])
+	}
+	if !r.Hits[2].Hit || !r.Hits[2].Echoable {
+		t.Errorf("replication point should hit and be marked echoable: %+v", r.Hits[2])
+	}
+	if r.KeypointRate != 2.0/3.0 {
+		t.Errorf("keypoint rate = %v, want 2/3", r.KeypointRate)
+	}
+}
+
+func TestSummarizeSplitsInferenceAndEcho(t *testing.T) {
+	results := []Result{{
+		CaseID: "E1", AlertID: "A1", Expected: domain.SeverityInfo, Actual: domain.SeverityInfo,
+		Hits: []Hit{
+			{Hit: true, Inference: true},
+			{Hit: false, Inference: true},
+			{Hit: true, Echoable: true},
+			{Hit: true},
+		},
+		KeypointRate: 0.75, SeverityOK: true, Score: 0.8,
+	}}
+	s := Summarize(results)
+	if s.Inference != 2 || s.InferenceHits != 1 || s.Replication != 2 || s.ReplicationHits != 2 {
+		t.Fatalf("split = %d/%d inference, %d/%d replication", s.InferenceHits, s.Inference, s.ReplicationHits, s.Replication)
+	}
+	if s.Echoable != 1 || s.EchoRate != 0.25 {
+		t.Fatalf("echoable = %d rate=%v, want 1/0.25", s.Echoable, s.EchoRate)
 	}
 }
 

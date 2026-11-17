@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -47,10 +48,12 @@ func New(baseURL, apiKey, model string, timeout time.Duration, maxTokens int, te
 func (c *Client) Model() string { return c.model }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	MaxTokens int       `json:"max_tokens,omitempty"`
+	// No omitempty: temperature=0 is a meaningful setting (deterministic
+	// sampling). Dropping it silently handed the decision to the server default.
+	Temperature float64 `json:"temperature"`
 }
 
 type chatResponse struct {
@@ -79,28 +82,100 @@ func (e *EmptyCompletionError) Error() string {
 	return "llm: empty completion content"
 }
 
-const maxRetryTokens = 16000
+// StatusError is a non-2xx upstream answer. 429 and 5xx are retried once with
+// exponential backoff; everything else (auth, bad request) fails immediately.
+type StatusError struct {
+	Code       int
+	Body       string
+	RetryAfter time.Duration
+}
 
-// Chat sends a system/user pair and returns the assistant text. If a reasoning
-// model exhausts the token budget before producing content, it retries once with
-// a doubled budget (capped) instead of failing the whole triage.
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("llm: upstream status %d: %s", e.Code, e.Body)
+}
+
+func (e *StatusError) retryable() bool {
+	switch e.Code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// MaxAttempts is the hard ceiling for one Chat call: the first request plus at
+// most one retry for an empty reasoning completion and one for 429/5xx. The
+// service uses it to size the overall deadline (per-attempt timeout * attempts)
+// so retries never consume the first attempt's budget.
+const MaxAttempts = 3
+
+const (
+	maxRetryTokens = 16000
+	backoffBase    = 300 * time.Millisecond
+	maxRetryAfter  = 5 * time.Second
+)
+
+// Chat sends a system/user pair and returns the assistant text.
+//
+// Retries are separate from the per-attempt timeout: http.Client.Timeout bounds
+// each attempt, so a retry gets a fresh budget instead of inheriting an expired
+// one. An empty completion is retried with a doubled token budget (capped);
+// 429/5xx are retried once after an exponential backoff, honouring Retry-After.
 func (c *Client) Chat(ctx context.Context, system, user string) (string, error) {
 	if c.apiKey == "" {
 		return "", fmt.Errorf("llm: empty api key")
 	}
-	content, err := c.chatOnce(ctx, system, user, c.maxTokens)
-	if err == nil {
-		return content, nil
-	}
-	var empty *EmptyCompletionError
-	if errors.As(err, &empty) && c.maxTokens < maxRetryTokens {
-		next := c.maxTokens * 2
-		if next > maxRetryTokens {
-			next = maxRetryTokens
+	effort := c.maxTokens
+	var lastErr error
+	for attempt := 1; attempt <= MaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-		return c.chatOnce(ctx, system, user, next)
+		content, err := c.chatOnce(ctx, system, user, effort)
+		if err == nil {
+			return content, nil
+		}
+		lastErr = err
+
+		var empty *EmptyCompletionError
+		if errors.As(err, &empty) && effort < maxRetryTokens && attempt < MaxAttempts {
+			effort *= 2
+			if effort > maxRetryTokens {
+				effort = maxRetryTokens
+			}
+			continue
+		}
+
+		var status *StatusError
+		if errors.As(err, &status) && status.retryable() && attempt < MaxAttempts {
+			if err := sleepBackoff(ctx, attempt, status.RetryAfter); err != nil {
+				return "", err
+			}
+			continue
+		}
+		return "", err
 	}
-	return "", err
+	return "", lastErr
+}
+
+// sleepBackoff waits base*2^(attempt-1), or Retry-After when the upstream
+// supplied one (capped so a hostile header cannot stall a triage).
+func sleepBackoff(ctx context.Context, attempt int, retryAfter time.Duration) error {
+	wait := retryAfter
+	if wait <= 0 {
+		wait = backoffBase << (attempt - 1)
+	}
+	if wait > maxRetryAfter {
+		wait = maxRetryAfter
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func (c *Client) chatOnce(ctx context.Context, system, user string, maxTokens int) (string, error) {
@@ -135,7 +210,11 @@ func (c *Client) chatOnce(ctx context.Context, system, user string, maxTokens in
 		return "", fmt.Errorf("llm: read response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("llm: upstream status %d: %s", resp.StatusCode, snippet(raw))
+		return "", &StatusError{
+			Code:       resp.StatusCode,
+			Body:       snippet(raw),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	var parsed chatResponse
@@ -162,4 +241,18 @@ func snippet(b []byte) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// parseRetryAfter understands the delta-seconds form (the form LLM gateways
+// send). HTTP-date form is ignored and falls back to exponential backoff.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }

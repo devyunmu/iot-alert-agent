@@ -11,6 +11,7 @@ import (
 
 	"github.com/devyunmu/iot-alert-agent/internal/agent"
 	"github.com/devyunmu/iot-alert-agent/internal/domain"
+	"github.com/devyunmu/iot-alert-agent/internal/llm"
 	"github.com/devyunmu/iot-alert-agent/internal/store"
 )
 
@@ -32,9 +33,19 @@ type Service struct {
 	group singleflight.Group
 }
 
-// New builds a Service. timeout bounds each LLM call.
+// New builds a Service. timeout bounds a single upstream attempt; a flight gets
+// timeout*llm.MaxAttempts so the client's retries never eat the first attempt's
+// budget (previously both were the same value and a retry had no time left).
 func New(st *store.Store, an agent.Analyzer, timeout time.Duration) *Service {
 	return &Service{store: st, analyzer: an, timeout: timeout}
+}
+
+// flightBudget is the deadline for one shared upstream call, including retries.
+func (s *Service) flightBudget() time.Duration {
+	if s.timeout <= 0 {
+		return 0
+	}
+	return s.timeout * time.Duration(llm.MaxAttempts)
 }
 
 // Analyzer exposes the configured analyzer (used for UI labels).
@@ -94,17 +105,23 @@ func (s *Service) Close(id string) (domain.Alert, bool, error) {
 // Analyze returns cached triage unless force is set. Only validated analyses are
 // cached, so a bad model response never poisons subsequent requests.
 //
-// Concurrent requests for the same alert share one in-flight analyzer call:
-// singleflight is keyed by alert id, and each caller re-checks the cache before
-// joining so a warm entry is never recomputed. The leader's context bounds the
-// shared call; a cancelled leader fails the batch and callers simply retry.
+// Concurrent requests share one in-flight call, keyed by alert id *and* the
+// force flag: a forced refresh must not be silently collapsed into a flight
+// that is serving cached data (and vice versa). Waiters wait on their own
+// context, while the shared call is detached from the leader with
+// context.WithoutCancel — one browser tab closing must not cancel an upstream
+// call that other callers are still waiting for.
 func (s *Service) Analyze(ctx context.Context, id string, force bool) (domain.Analysis, error) {
 	if !force {
 		if cached, ok := s.store.GetAnalysis(id); ok {
 			return cached, nil
 		}
 	}
-	v, err, _ := s.group.Do(id, func() (any, error) {
+	key := id
+	if force {
+		key += "|force"
+	}
+	ch := s.group.DoChan(key, func() (any, error) {
 		// A previous flight may have filled the cache between the check above
 		// and Do; re-reading here avoids a duplicate call in that window.
 		if !force {
@@ -112,16 +129,29 @@ func (s *Service) Analyze(ctx context.Context, id string, force bool) (domain.An
 				return cached, nil
 			}
 		}
-		return s.generate(ctx, id)
+		// Detach the shared call from any single caller's cancellation, then
+		// bound it with the retry-aware budget.
+		flightCtx := context.WithoutCancel(ctx)
+		if budget := s.flightBudget(); budget > 0 {
+			var cancel context.CancelFunc
+			flightCtx, cancel = context.WithTimeout(flightCtx, budget)
+			defer cancel()
+		}
+		return s.generate(flightCtx, id)
 	})
-	if err != nil {
-		return domain.Analysis{}, err
+	select {
+	case <-ctx.Done():
+		return domain.Analysis{}, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return domain.Analysis{}, res.Err
+		}
+		an, ok := res.Val.(domain.Analysis)
+		if !ok {
+			return domain.Analysis{}, fmt.Errorf("analyze %s: unexpected result type %T", id, res.Val)
+		}
+		return an, nil
 	}
-	an, ok := v.(domain.Analysis)
-	if !ok {
-		return domain.Analysis{}, fmt.Errorf("analyze %s: unexpected result type %T", id, v)
-	}
-	return an, nil
 }
 
 func (s *Service) generate(ctx context.Context, id string) (domain.Analysis, error) {
@@ -132,11 +162,6 @@ func (s *Service) generate(ctx context.Context, id string) (domain.Analysis, err
 	d, err := s.store.GetDevice(a.DeviceID)
 	if err != nil {
 		return domain.Analysis{}, fmt.Errorf("load device: %w", err)
-	}
-	if s.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.timeout)
-		defer cancel()
 	}
 	an, err := s.analyzer.Analyze(ctx, a, d)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,7 +73,9 @@ func TestEvalSet(t *testing.T) {
 		sc.PassThreshold = f
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	// Generous ceiling: a case may legitimately spend per-attempt timeout ×
+	// retry attempts, so this bounds a hung run rather than a slow one.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 	start := time.Now()
 	results := eval.Run(ctx, an, st, set, workers)
@@ -88,6 +91,82 @@ func TestEvalSet(t *testing.T) {
 	if !summary.Passed {
 		t.Errorf("evaluation did not pass (errors=%d, avg=%.3f)", summary.Errors, summary.AvgScore)
 	}
+}
+
+// TestEvalSetHonesty guards the anti-leakage design: some expected severities
+// must deliberately differ from the rule baseline, and a keypoint marked
+// requires_inference must not be satisfiable by copying the alert text.
+func TestEvalSetHonesty(t *testing.T) {
+	set, err := eval.LoadSet(bytes.NewReader(evalsJSON))
+	if err != nil {
+		t.Fatalf("load evalset: %v", err)
+	}
+	st, err := loadStore()
+	if err != nil {
+		t.Fatalf("load dataset: %v", err)
+	}
+
+	var counter, keypoints, inference, echoable int
+	var baseKPs, baseEchoable int
+	seenAlerts := map[string]string{}
+	for _, c := range set.Cases {
+		if prev, ok := seenAlerts[c.AlertID]; ok {
+			t.Errorf("cases %s and %s score the same alert %s", prev, c.ID, c.AlertID)
+		}
+		seenAlerts[c.AlertID] = c.ID
+
+		alert, err := st.GetAlert(c.AlertID)
+		if err != nil {
+			t.Fatalf("case %s: %v", c.ID, err)
+		}
+		baselineCase := c.ExpectedSeverity == alert.Severity
+		if !baselineCase {
+			counter++
+			infer := 0
+			for _, kp := range c.Keypoints {
+				if kp.RequiresInference {
+					infer++
+				}
+			}
+			if infer < 2 {
+				t.Errorf("case %s disagrees with baseline %s but has %d inference keypoints; the disagreement needs a written reasoning basis",
+					c.ID, alert.Severity, infer)
+			}
+		}
+		source := strings.ToLower(alert.Title + "\n" + alert.Message)
+		if baselineCase {
+			baseKPs += len(c.Keypoints)
+		}
+		for _, kp := range c.Keypoints {
+			keypoints++
+			echo := false
+			for _, p := range kp.Any {
+				if eval.Matches(source, p) {
+					echo = true
+					if kp.RequiresInference {
+						t.Errorf("case %s keypoint %s is requires_inference but pattern %q is copyable from the alert text",
+							c.ID, kp.ID, p)
+					}
+				}
+			}
+			if echo {
+				echoable++
+				if baselineCase {
+					baseEchoable++
+				}
+			}
+			if kp.RequiresInference {
+				inference++
+			}
+		}
+	}
+	if counter < 3 {
+		t.Errorf("only %d cases disagree with the rule baseline; need at least 3", counter)
+	}
+	t.Logf("cases=%d keypoints=%d inference=%d counter-baseline=%d echoable=%d (%.0f%%)",
+		len(set.Cases), keypoints, inference, counter, echoable, 100*float64(echoable)/float64(keypoints))
+	t.Logf("baseline-aligned subset: keypoints=%d echoable=%d (%.0f%%)",
+		baseKPs, baseEchoable, 100*float64(baseEchoable)/float64(baseKPs))
 }
 
 func selectAnalyzer(mode string) (agent.Analyzer, string, error) {
