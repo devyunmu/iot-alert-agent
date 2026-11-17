@@ -1,0 +1,186 @@
+{
+  "generated_at": "2026-11-17T08:00:00Z",
+  "note": "全合成演示数据，不含任何真实设备或客户信息",
+  "devices": [
+    {
+      "id": "DEV-1001",
+      "name": "冷库温湿度传感器-01",
+      "model": "TH-200",
+      "site": "园区A / 1号冷库",
+      "firmware": "2.3.1",
+      "status": "online",
+      "battery": 87,
+      "last_seen": "2026-11-17T07:58:00Z",
+      "tags": [
+        "冷链",
+        "温湿度",
+        "LoRa"
+      ]
+    },
+    {
+      "id": "DEV-1002",
+      "name": "冷库温湿度传感器-02",
+      "model": "TH-200",
+      "site": "园区A / 1号冷库",
+      "firmware": "2.3.1",
+      "status": "online",
+      "battery": 9,
+      "last_seen": "2026-11-17T07:55:00Z",
+      "tags": [
+        "冷链",
+        "温湿度",
+        "LoRa"
+      ]
+    },
+    {
+      "id": "DEV-1003",
+      "name": "冷藏车门磁传感器-01",
+      "model": "DS-100",
+      "site": "园区A / 1号冷库",
+      "firmware": "1.4.7",
+      "status": "online",
+      "battery": 12,
+      "last_seen": "2026-11-17T07:50:00Z",
+      "tags": [
+        "冷链",
+        "门磁",
+        "LoRa"
+      ]
+    },
+    {
+      "id": "DEV-1004",
+      "name": "库区网关-01",
+      "model": "GW-500",
+      "site": "园区A / 1号冷库",
+      "firmware": "1.8.0",
+      "status": "offline",
+      "battery": null,
+      "last_seen": "2026-11-17T07:24:00Z",
+      "tags": [
+        "网关",
+        "以太网",
+        "边缘"
+      ]
+    },
+    {
+      "id": "DEV-1005",
+      "name": "温控执行器-01",
+      "model": "AC-310",
+      "site": "园区A / 2号冷库",
+      "firmware": "3.1.2",
+      "status": "offline",
+      "battery": null,
+      "last_seen": "2026-11-17T06:33:00Z",
+      "tags": [
+        "冷链",
+        "执行器",
+        "4G"
+      ]
+    },
+    {
+      "id": "DEV-1006",
+      "name": "烟感探测器-01",
+      "model": "SM-90",
+      "site": "园区A / 2号冷库",
+      "firmware": "1.2.9",
+      "status": "online",
+      "battery": 14,
+      "last_seen": "2026-11-17T07:57:00Z",
+      "tags": [
+        "消防",
+        "烟感",
+        "NB-IoT"
+      ]
+    },
+    {
+      "id": "DEV-1007",
+      "name": "电表采集器-01",
+      "model": "EM-220",
+      "site": "园区A / 配电间",
+      "firmware": "2.0.4",
+      "status": "online",
+      "battery": null,
+      "last_seen": "2026-11-17T07:56:00Z",
+      "tags": [
+        "能耗",
+        "电流",
+        "RS485"
+      ]
+    },
+    {
+      "id": "DEV-1008",
+      "name": "冷链车载定位终端-01",
+      "model": "GPS-45",
+      "site": "园区A / 车队",
+      "firmware": "4.0.1",
+      "status": "offline",
+      "battery": 11,
+      "last_seen": "2026-11-17T01:40:00Z",
+      "tags": [
+        "冷链",
+        "定位",
+        "4G"
+      ]
+    },
+    {
+      "id": "DEV-1009",
+      "name": "水质PH传感器-01",
+      "model": "PH-11",
+      "site": "园区B / 污水处理站",
+      "firmware": "1.6.3",
+      "status": "online",
+      "battery": null,
+      "last_seen": "2026-11-17T07:52:00Z",
+      "tags": [
+        "水务",
+        "PH",
+        "NB-IoT"
+      ]
+    },
+    {
+      "id": "DEV-1010",
+      "name": "消防水池液位传感器-01",
+      "model": "LV-70",
+      "site": "园区B / 消防水池",
+      "firmware": "1.1.8",
+      "status": "offline",
+      "battery": 7,
+      "last_seen": "2026-11-17T05:31:00Z",
+      "tags": [
+        "消防",
+        "液位",
+        "LoRa"
+      ]
+    },
+    {
+      "id": "DEV-1011",
+      "name": "边缘计算盒子-01",
+      "model": "EDGE-8",
+      "site": "园区A / 机房",
+      "firmware": "5.2.0",
+      "status": "offline",
+      "battery": null,
+      "last_seen": "2026-11-17T07:33:00Z",
+      "tags": [
+        "边缘",
+        "MQTT",
+        "以太网"
+      ]
+    },
+    {
+      "id": "DEV-1012",
+      "name": "门禁控制器-01",
+      "model": "AC-12",
+      "site": "园区A / 东门",
+      "firmware": "2.7.5",
+      "status": "offline",
+      "battery": null,
+      "last_seen": "2026-11-17T07:03:00Z",
+      "tags": [
+        "安防",
+        "门禁",
+        "以太网"
+      ]
+    }
+  ]
+}

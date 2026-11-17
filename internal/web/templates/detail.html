@@ -1,0 +1,174 @@
+{{define "detail.html"}}{{template "head" .}}
+{{template "nav" .}}
+
+<main class="wrap">
+  <a class="back" href="/">← 返回告警列表</a>
+
+  {{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
+  {{if .Error}}<div class="banner error">{{.Error}}</div>{{end}}
+
+  <section class="detail-head">
+    <div>
+      <div class="pill-row">
+        <span class="pill sev-{{.Alert.Severity}}">{{sevLabel .Alert.Severity}}</span>
+        <span class="type-chip">{{typeLabel .Alert.Type}}</span>
+        <span class="status status-{{.Alert.Status}}">{{statusLabel .Alert.Status}}</span>
+      </div>
+      <h1>{{.Alert.Title}}</h1>
+      <p class="meta-line">
+        <span class="mono">{{.Alert.ID}}</span>
+        <span class="dot">·</span>
+        <span>{{.Alert.Device.Name}}</span>
+        <span class="dot">·</span>
+        <span>{{.Alert.Device.Site}}</span>
+        <span class="dot">·</span>
+        <span>{{ts .Alert.CreatedAt}}</span>
+      </p>
+    </div>
+    <div class="actions">
+      {{if eq (printf "%s" .Alert.Status) "open"}}
+      <form method="post" action="/alerts/{{.Alert.ID}}/ack" class="inline-form">
+        <input class="operator" type="text" name="operator" value="web-console" maxlength="40" aria-label="操作人">
+        <button class="btn" type="submit">确认告警</button>
+      </form>
+      {{end}}
+      <form method="post" action="/alerts/{{.Alert.ID}}/analyze{{if .Alert.Analysis}}?force=1{{end}}" class="inline-form">
+        <button class="btn accent" type="submit">{{if .Alert.Analysis}}重新生成建议{{else}}生成 AI 处置建议{{end}}</button>
+      </form>
+    </div>
+  </section>
+
+  <div class="detail-grid">
+    <div class="col-main">
+      <section class="card">
+        <h2>事件详情</h2>
+        <p class="message">{{.Alert.Message}}</p>
+        <dl class="facts">
+          <div><dt>指标</dt><dd class="mono">{{if .Alert.Metric}}{{.Alert.Metric}}{{else}}—{{end}}</dd></div>
+          <div><dt>当前值 / 阈值</dt><dd class="mono">{{valueText .Alert}}</dd></div>
+          <div><dt>重复次数</dt><dd>{{.Alert.Occurrences}} 次</dd></div>
+          <div><dt>规则 ID</dt><dd class="mono">{{if .Alert.RuleID}}{{.Alert.RuleID}}{{else}}—{{end}}</dd></div>
+          <div><dt>首次发生</dt><dd class="mono">{{ts .Alert.FirstSeen}}</dd></div>
+          <div><dt>最近发生</dt><dd class="mono">{{ts .Alert.LastSeen}}</dd></div>
+          {{if .Alert.OTATarget}}<div><dt>目标固件</dt><dd class="mono">{{.Alert.OTATarget}}</dd></div>{{end}}
+        </dl>
+      </section>
+
+      <section class="card ai-card">
+        <div class="card-head">
+          <h2>AI 处置建议</h2>
+          {{if .Alert.Analysis}}
+            {{if .Alert.Analysis.Mock}}
+              <span class="mini-badge mock">规则回退</span>
+            {{else}}
+              <span class="mini-badge live">{{.Alert.Analysis.Model}}</span>
+            {{end}}
+          {{end}}
+        </div>
+
+        {{with .Alert.Analysis}}
+        <div class="ai-summary">{{.Summary}}</div>
+
+        <div class="ai-sev">
+          <span class="pill sev-{{.Severity}}">{{sevLabel .Severity}}</span>
+          <span class="muted">{{.SeverityReason}}</span>
+        </div>
+
+        <div class="ai-block">
+          <h3>可能原因</h3>
+          <ul class="causes">
+            {{range .LikelyCauses}}<li>{{.}}</li>{{else}}<li class="muted">模型未给出原因</li>{{end}}
+          </ul>
+        </div>
+
+        <div class="ai-block">
+          <h3>建议处置步骤</h3>
+          <ol class="steps">
+            {{range .Actions}}<li>{{.}}</li>{{else}}<li class="muted">模型未给出步骤</li>{{end}}
+          </ol>
+        </div>
+
+        <div class="ai-foot">
+          <div class="confidence">
+            <span class="muted">置信度</span>
+            <span class="bar"><i style="width: {{pct .Confidence}}%"></i></span>
+            <span class="mono">{{pct .Confidence}}%</span>
+          </div>
+          <span class="muted mono">{{.Model}} · {{.LatencyMS}} ms · {{ts .GeneratedAt}}</span>
+        </div>
+        {{else}}
+        <div class="ai-empty">
+          <p>尚未生成 AI 分诊。分析会结合设备档案、告警数值与历史状态，输出摘要、定级理由和可执行步骤。</p>
+          <form method="post" action="/alerts/{{$.Alert.ID}}/analyze">
+            <button class="btn accent" type="submit">生成 AI 处置建议</button>
+          </form>
+          <p class="hint">未配置 LLM_API_KEY 时自动使用规则回退，结果会明确标注，不会伪装成模型输出。</p>
+        </div>
+        {{end}}
+      </section>
+
+      <section class="card">
+        <h2>处置时间线</h2>
+        <ul class="timeline">
+          {{range .Events}}
+          <li>
+            <span class="tl-dot"></span>
+            <span class="tl-time mono">{{ts .At}}</span>
+            <span class="tl-label">{{.Label}}</span>
+            <span class="muted">{{.Detail}}</span>
+          </li>
+          {{end}}
+        </ul>
+      </section>
+    </div>
+
+    <aside class="col-side">
+      <section class="card">
+        <h2>设备档案</h2>
+        <div class="device-name">{{.Alert.Device.Name}}</div>
+        <div class="mono muted">{{.Alert.Device.ID}}</div>
+        <dl class="facts single">
+          <div><dt>型号</dt><dd>{{.Alert.Device.Model}}</dd></div>
+          <div><dt>站点</dt><dd>{{.Alert.Device.Site}}</dd></div>
+          <div><dt>固件</dt><dd class="mono">{{.Alert.Device.Firmware}}</dd></div>
+          <div><dt>在线状态</dt><dd><span class="dev-status dev-{{.Alert.Device.Status}}">{{.Alert.Device.Status}}</span></dd></div>
+          <div><dt>电量</dt><dd>{{battery .Alert.Device.Battery}}</dd></div>
+          <div><dt>最后心跳</dt><dd class="mono">{{ts .Alert.Device.LastSeen}}</dd></div>
+        </dl>
+        <div class="tags">
+          {{range .Alert.Device.Tags}}<span class="tag">{{.}}</span>{{end}}
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>人工确认</h2>
+        {{if eq (printf "%s" .Alert.Status) "open"}}
+        <p class="muted">确认后告警进入已确认状态，AI 建议保留供后续复盘。</p>
+        <form method="post" action="/alerts/{{.Alert.ID}}/ack">
+          <input class="operator wide" type="text" name="operator" value="web-console" maxlength="40" aria-label="操作人">
+          <button class="btn" type="submit">确认告警</button>
+        </form>
+        {{else if eq (printf "%s" .Alert.Status) "acked"}}
+        <p>已由 <strong>{{.Alert.AckedBy}}</strong> 确认</p>
+        <p class="muted mono">{{if .Alert.AckedAt}}{{ts .Alert.AckedAt}}{{end}}</p>
+        {{else}}
+        <p>告警已关闭</p>
+        <p class="muted">确认人 {{.Alert.AckedBy}}{{if .Alert.ClosedAt}} · {{ts .Alert.ClosedAt}}{{end}}</p>
+        {{end}}
+      </section>
+
+      <section class="card hint-card">
+        <h2>MCP 工具接入</h2>
+        <p class="muted">同一份数据与分诊能力通过 MCP 暴露给任意 Agent 客户端：</p>
+        <ul class="tool-list">
+          <li><code>list_alerts</code><span>按状态/级别筛选告警</span></li>
+          <li><code>get_device</code><span>读取设备档案与关联告警</span></li>
+          <li><code>summarize_alert</code><span>生成并缓存分诊建议</span></li>
+          <li><code>ack_alert</code><span>幂等确认，形成闭环</span></li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+</main>
+
+{{template "footer" .}}{{end}}

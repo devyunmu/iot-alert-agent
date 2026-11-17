@@ -1,0 +1,13 @@
+{{define "error.html"}}{{template "head" .}}
+{{template "nav" .}}
+
+<main class="wrap">
+  <section class="error-page">
+    <span class="error-code">404</span>
+    <h1>{{if .Error}}{{.Error}}{{else}}页面不存在{{end}}</h1>
+    <p class="muted">请求的告警可能已归档，或链接不正确。</p>
+    <a class="btn" href="/">返回告警列表</a>
+  </section>
+</main>
+
+{{template "footer" .}}{{end}}

@@ -1,0 +1,121 @@
+{{define "index.html"}}{{template "head" .}}
+{{template "nav" .}}
+
+<main class="wrap">
+  <section class="page-head">
+    <div>
+      <h1>告警处置台</h1>
+      <p class="sub">设备告警 → LLM 分诊 → 工单摘要与处置建议 → 人工确认，闭环可追踪。</p>
+    </div>
+    <div class="head-note">
+      <span class="pulse"></span>
+      演示数据快照 · 2026-11-17
+    </div>
+  </section>
+
+  <section class="stats">
+    <div class="stat">
+      <span class="stat-label">告警总数</span>
+      <strong class="stat-value">{{.Stats.Total}}</strong>
+      <span class="stat-foot">近 72 小时</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">待处理</span>
+      <strong class="stat-value warn">{{.Stats.Open}}</strong>
+      <span class="stat-foot">尚未人工确认</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">严重告警</span>
+      <strong class="stat-value danger">{{.Stats.Critical}}</strong>
+      <span class="stat-foot">未关闭的 critical</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">已关闭</span>
+      <strong class="stat-value">{{.Stats.Closed}}</strong>
+      <span class="stat-foot">处置完成</span>
+    </div>
+  </section>
+
+  <form class="filters" method="get" action="/">
+    <input class="search" type="search" name="q" value="{{.Filter.Query}}" placeholder="搜索告警标题、设备、站点…" maxlength="80">
+    <select name="type">
+      <option value="">全部类型</option>
+      {{range .TypeOptions}}
+      <option value="{{.Value}}" {{if eq (printf "%s" $.Filter.Type) .Value}}selected{{end}}>{{.Label}}</option>
+      {{end}}
+    </select>
+    <select name="severity">
+      <option value="">全部级别</option>
+      {{range .SevOptions}}
+      <option value="{{.Value}}" {{if eq (printf "%s" $.Filter.Severity) .Value}}selected{{end}}>{{.Label}}</option>
+      {{end}}
+    </select>
+    <select name="status">
+      <option value="">全部状态</option>
+      {{range .StatusOpts}}
+      <option value="{{.Value}}" {{if eq (printf "%s" $.Filter.Status) .Value}}selected{{end}}>{{.Label}}</option>
+      {{end}}
+    </select>
+    <button class="btn" type="submit">筛选</button>
+    <a class="btn ghost" href="/">重置</a>
+  </form>
+
+  <section class="table-card">
+    <div class="table-head">
+      <span>{{len .Alerts}} 条结果</span>
+      <span class="muted">按严重度与时间排序</span>
+    </div>
+    {{if .Alerts}}
+    <table class="alert-table">
+      <thead>
+        <tr>
+          <th class="col-sev">级别</th>
+          <th>告警</th>
+          <th class="col-device">设备 / 站点</th>
+          <th class="col-type">类型</th>
+          <th class="col-time">发生时间</th>
+          <th class="col-status">状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Alerts}}
+        <tr>
+          <td><span class="pill sev-{{.Severity}}">{{sevLabel .Severity}}</span></td>
+          <td class="cell-main">
+            <a class="alert-link" href="/alerts/{{.ID}}">{{.Title}}</a>
+            <span class="alert-id">{{.ID}}{{if .Analysis}} · <span class="ai-dot">已分诊</span>{{end}}</span>
+          </td>
+          <td class="cell-device">
+            {{.Device.Name}}
+            <span class="muted">{{.Device.Site}}</span>
+          </td>
+          <td><span class="type-chip">{{typeLabel .Type}}</span></td>
+          <td class="mono">{{ts .CreatedAt}}</td>
+          <td><span class="status status-{{.Status}}">{{statusLabel .Status}}</span></td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div class="empty">
+      <p>没有匹配的告警。</p>
+      <a href="/">清除筛选条件</a>
+    </div>
+    {{end}}
+  </section>
+
+  <section class="narrative">
+    <div>
+      <h2>为什么是这个项目</h2>
+      <p>把物联网平台积累的设备接入、告警规则与现场处置经验，封装成 Agent 可直接调用的 MCP 工具，并用评测集量化 LLM 输出质量——这是从平台工程师走向 Agent 平台工程师的能力证明。</p>
+    </div>
+    <ul>
+      <li><code>list_alerts</code> 查询告警队列</li>
+      <li><code>get_device</code> 读取设备档案</li>
+      <li><code>summarize_alert</code> 生成分诊建议</li>
+      <li><code>ack_alert</code> 人工确认闭环</li>
+    </ul>
+  </section>
+</main>
+
+{{template "footer" .}}{{end}}

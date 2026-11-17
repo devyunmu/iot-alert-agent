@@ -1,0 +1,16 @@
+# binaries
+/bin/
+/iot-alert-agent
+/iot-mcp
+
+# test artefacts
+*.test
+coverage.out
+
+# local env
+.env
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,40 @@
+{{define "head"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · IoT Alert Agent</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='9' fill='%235eead4'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+{{end}}
+
+{{define "nav"}}
+<header class="topbar">
+  <a class="brand" href="/">
+    <span class="brand-mark"></span>
+    <span class="brand-name">IoT Alert Agent</span>
+    <span class="brand-sub">设备告警智能处置</span>
+  </a>
+  <div class="topbar-right">
+    {{if .Mock}}
+      <span class="llm-badge mock" title="未配置 LLM_API_KEY，当前为规则回退">MOCK · {{.Model}}</span>
+    {{else}}
+      <span class="llm-badge live" title="OpenAI 兼容端点">LLM · {{.Model}}</span>
+    {{end}}
+    <a class="topbar-link" href="/api/alerts">API</a>
+    <a class="topbar-link" href="/healthz">Health</a>
+  </div>
+</header>
+{{end}}
+
+{{define "footer"}}
+<footer class="footer">
+  <span>IoT Alert Agent · Go + Gin + MCP</span>
+  <span class="dot">·</span>
+  <span>全合成演示数据（30 条告警 / 12 台设备），不含真实设备或客户信息</span>
+</footer>
+</body>
+</html>
+{{end}}
