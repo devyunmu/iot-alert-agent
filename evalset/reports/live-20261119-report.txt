@@ -1,0 +1,59 @@
+=== RUN   TestEvalSet
+
+=== IoT Alert Agent · 评测报告 ===
+模式: live     分析器: glm-5.3-flash                用例: 18
+评分: 要点命中 80% (weight 0.80) + 定级准确率（模型 vs 规则基线）20% (weight 0.20)，通过阈值 0.75
+------------------------------------------------------------------------------
+CASE    ALERT      LEVEL  SEV  KEYPOINTS SCORE  LATENCY 
+EV-01   ALT-0001   crit   ✓    5/5       1.00   19692ms 
+EV-02   ALT-0002   crit   ✓    3/4       0.80   27037ms 
+EV-03   ALT-0005   crit   ✓    5/5       1.00   16468ms 
+EV-04   ALT-0007   warn   ✗    4/4       0.80   53637ms 
+EV-05   ALT-0006   warn   ✗    3/4       0.60   22790ms 
+EV-06   ALT-0009   crit   ✓    4/4       1.00   12827ms 
+EV-07   ALT-0012   crit   ✓    4/5       0.84   20836ms 
+EV-08   ALT-0013   crit   ✓    4/4       1.00   18069ms 
+EV-09   ALT-0018   warn   ✓    4/4       1.00   25816ms 
+EV-10   ALT-0021   crit   ✓    4/4       1.00   15169ms 
+EV-11   ALT-0025   crit   ✓    4/4       1.00   36725ms 
+EV-12   ALT-0027   crit   ✓    4/4       1.00   21527ms 
+EV-13   ALT-0020   crit   ✓    4/5       0.84   40293ms 
+EV-14   ALT-0030   warn   ✗    4/4       0.80   25935ms 
+EV-15   ALT-0015   info   ✗    0/4       0.00   28483ms 
+EV-16   ALT-0003   crit   ✓    2/4       0.60   34467ms 
+EV-17   ALT-0011   crit   ✓    3/4       0.80   31466ms 
+EV-18   ALT-0008   crit   ✓    1/4       0.40   22740ms 
+------------------------------------------------------------------------------
+要点命中率 0.816 (62/76) · 推理要点 26/38 · 复读要点 36/38 · 定级准确率 0.778 · 平均得分 0.804 · 错误 0
+可复读要点 38/76 (50%)：仅抄告警 title/message 即可命中，不反映分诊能力；推理要点按 requires_inference 单独计分
+未命中明细:
+  EV-02 ALT-0002: 漏检 kp4 (检查门体/风幕/密封)
+  EV-04 ALT-0007: 定级 critical != 期望 warning
+  EV-05 ALT-0006: 定级 critical != 期望 warning
+  EV-05 ALT-0006: 漏检 kp2 (关注重传/丢包)
+  EV-07 ALT-0012: 漏检 kp5 (通风/断电/排烟)
+  EV-13 ALT-0020: 漏检 kp5 (备件/工单)
+  EV-14 ALT-0030: 定级 critical != 期望 warning
+  EV-15 ALT-0015: 定级 warning != 期望 info
+  EV-15 ALT-0015: 漏检 kp1 (推理：离线发生在收车停场期间，属于可预期的正常状态，无需当班处置)
+  EV-15 ALT-0015: 漏检 kp2 (推理：按信息级记录，下次出车前确认设备重新上线即可)
+  EV-15 ALT-0015: 漏检 kp3 (推理：车辆未在途、无货品暴露，因此不应升级为冷链/安全事件)
+  EV-15 ALT-0015: 漏检 kp4 (推理：离线时长与停车时段吻合，可排除被盗或异常拆卸)
+  EV-16 ALT-0003: 漏检 kp1 (推理：真正风险是冷链监测即将出现盲区，不是普通低电量)
+  EV-16 ALT-0003: 漏检 kp3 (推理：说明升级理由——失去温湿度监测会造成不可见的货损，故定级高于基线)
+  EV-17 ALT-0011: 漏检 kp3 (推理：升级依据是消防设备失效会危及人身安全，故高于基线 warning)
+  EV-18 ALT-0008: 漏检 kp1 (推理：8.2°C 的实际回风已进入货品不安全区间，不是单纯的执行器偏差)
+  EV-18 ALT-0008: 漏检 kp2 (推理：定级依据是冷链温控失效影响业务连续性，故高于基线 warning)
+  EV-18 ALT-0008: 漏检 kp4 (推理：检查执行器阀门/开度与实际制冷输出是否脱节)
+结论: PASS（阈值 0.75，错误数 0）
+
+总耗时 158.1s（并发 3）
+
+评测产物已写入 /home/yunmu/projects/iot-alert-agent/evalset/reports/live-20261119.jsonl（18 条）
+--- PASS: TestEvalSet (158.13s)
+=== RUN   TestEvalSetHonesty
+    eval_test.go:185: cases=18 keypoints=76 inference=38 counter-baseline=4 echoable=38 (50%)
+    eval_test.go:187: baseline-aligned subset: keypoints=60 echoable=38 (63%)
+--- PASS: TestEvalSetHonesty (0.00s)
+PASS
+ok  	github.com/devyunmu/iot-alert-agent/evalset	158.137s

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -81,6 +82,24 @@ func TestEvalSet(t *testing.T) {
 	results := eval.Run(ctx, an, st, set, workers)
 	summary := eval.RenderReport(os.Stdout, modeLabel, an.Describe(), results, sc)
 	fmt.Printf("总耗时 %.1fs（并发 %d）\n\n", time.Since(start).Seconds(), workers)
+
+	// EVAL_DUMP=<path> persists one JSON line per case (full structured output
+	// included) so reports are auditable without re-running the model.
+	if dump := os.Getenv("EVAL_DUMP"); dump != "" {
+		f, err := os.Create(dump)
+		if err != nil {
+			t.Fatalf("open dump %s: %v", dump, err)
+		}
+		enc := json.NewEncoder(f)
+		for _, r := range results {
+			if err := enc.Encode(r); err != nil {
+				f.Close()
+				t.Fatalf("encode dump: %v", err)
+			}
+		}
+		f.Close()
+		fmt.Printf("评测产物已写入 %s（%d 条）\n", dump, len(results))
+	}
 
 	if summary.Errors > 0 {
 		t.Errorf("%d/%d cases failed to produce a valid analysis", summary.Errors, summary.Cases)

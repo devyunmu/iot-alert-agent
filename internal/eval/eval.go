@@ -149,7 +149,10 @@ type Result struct {
 	Score        float64         `json:"score"`
 	LatencyMS    int64           `json:"latency_ms"`
 	SummaryText  string          `json:"summary,omitempty"`
-	Err          string          `json:"error,omitempty"`
+	// Analysis is the analyzer's full structured output, retained so eval
+	// artifacts can be audited without re-running the model.
+	Analysis *domain.Analysis `json:"analysis,omitempty"`
+	Err      string           `json:"error,omitempty"`
 }
 
 // Run analyzes every case against the given alert store. workers bounds
@@ -206,6 +209,7 @@ func runOne(ctx context.Context, an agent.Analyzer, st *store.Store, c Case, sc 
 	}
 	r.Actual = an1.Severity
 	r.SummaryText = an1.Summary
+	r.Analysis = &an1
 	text := matchText(an1)
 	source := sourceText(alert)
 	for i, kp := range c.Keypoints {
