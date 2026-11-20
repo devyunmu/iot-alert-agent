@@ -8,6 +8,8 @@
 ![Data](https://img.shields.io/badge/data-100%25%20synthetic-FBBF24)
 ![License](https://img.shields.io/badge/license-MIT-8A9BB0)
 
+![演示：告警列表 → AI 处置建议生成 → 人工确认](docs/demo.gif)
+
 ---
 
 ## 为什么做这个项目
